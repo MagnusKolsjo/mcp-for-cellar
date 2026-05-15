@@ -23,15 +23,9 @@ import logging
 from pathlib import Path
 from typing import Optional
 
-from dotenv import load_dotenv
-
-# VIKTIGT: load_dotenv() MÅSTE köras FÖRE "import db"
-# db.py läser DATABASE_URL på modulnivå — kör den innan environ är populerat
-# och db.DATABASE_URL blir alltid "" (tom sträng), cachen används aldrig.
-load_dotenv()
-
 import requests
 from bs4 import BeautifulSoup
+from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
 
 import db
@@ -39,6 +33,8 @@ import db
 # ---------------------------------------------------------------------------
 # Konfiguration
 # ---------------------------------------------------------------------------
+
+load_dotenv()
 
 _SCRIPT_DIR = Path(__file__).parent.resolve()
 
@@ -219,40 +215,66 @@ def _kora_sparql(query: str) -> list[dict]:
     return rader
 
 
-_LANG_MAP_2TO3 = {
-    "SV": "SWE", "EN": "ENG", "DE": "DEU", "FR": "FRA",
-    "DA": "DAN", "FI": "FIN", "NL": "NLD", "PL": "POL",
-    "ES": "SPA", "IT": "ITA", "PT": "POR", "CS": "CES",
-    "HU": "HUN", "RO": "RON", "SK": "SLK", "SL": "SLV",
-}
+def _hamta_xhtml(celex: str, sprak: str) -> str:
+    """Hämtar XHTML-fulltext för en EU-rättsakt via CELLAR REST API.
 
+    Protokoll (dokumenterat via reverse-engineering av CELLAR WEMI-modellen):
 
-def _normalisera_sprak(sprak: str) -> str:
-    """Normaliserar språkkod till 3-bokstavs ISO 639-2/T (SWE, ENG, ...)."""
-    lang = sprak.strip().upper()
-    if len(lang) == 2:
-        lang = _LANG_MAP_2TO3.get(lang, lang)
-    return lang
+    1. GET {CELLAR_REST_BASE}/{CELEX}.{LANG}.xhtml  →  HTTP 303
+       Location: http://publications.europa.eu/resource/cellar/{uuid}.{expr}.{manif}/rdf/object/full
 
+    2. Ersätt /rdf/object/full med /DOC_N och hämta varje item.
+       Hämta manifestation-RDF för att hitta alla DOC-items,
+       eller prova DOC_1 .. DOC_10 tills 404.
 
-def _hamta_xhtml_fran_manifestation(manif_iri: str) -> str:
-    """Hämtar XHTML-innehåll från en känd CELLAR-manifestations-IRI.
-
-    Listar DOC-items via RDF och hämtar dem i ordning.
+    Språkkod ska vara 3-bokstavs ISO 639-2/T (SWE, ENG, DEU, FRA, ...).
     """
-    rdf_url = f"{manif_iri}/rdf/object/full"
+    lang = sprak.upper()
+    # Mappa 2-bokstavs → 3-bokstavs om användaren skickar ISO 639-1
+    _lang_map = {"SV": "SWE", "EN": "ENG", "DE": "DEU", "FR": "FRA",
+                 "DA": "DAN", "FI": "FIN", "NL": "NLD", "PL": "POL",
+                 "ES": "SPA", "IT": "ITA", "PT": "POR", "CS": "CES",
+                 "HU": "HUN", "RO": "RON", "SK": "SLK", "SL": "SLV"}
+    if len(lang) == 2:
+        lang = _lang_map.get(lang, lang)
+
+    manifest_url = f"{CELLAR_REST_BASE}/{celex}.{lang}.xhtml"
+    log.info("Hämtar CELLAR manifestation: %s", manifest_url)
+
+    # Steg 1: 303-redirect ger oss manifestationens UUID
+    r1 = requests.get(manifest_url, timeout=REST_TIMEOUT, allow_redirects=False)
+    if r1.status_code == 404:
+        raise ValueError(
+            f"Ingen XHTML-manifestation för {celex} på {lang}. "
+            "Akten kanske inte finns i CELLAR eller saknar den begärda språkversionen."
+        )
+    if r1.status_code != 303:
+        raise ValueError(
+            f"Oväntat HTTP {r1.status_code} från CELLAR för {celex}.{lang}.xhtml"
+        )
+
+    location = r1.headers.get("Location", "")
+    if not "/rdf/object/full" in location:
+        raise ValueError(f"Oväntat Location-svar från CELLAR: {location}")
+
+    # Bas-URL för DOC-items = location utan /rdf/object/full
+    manif_bas = location.replace("/rdf/object/full", "")
+
+    # Steg 2: Hämta manifestation-RDF och lista alla DOC-items
     try:
-        rdf_text = requests.get(rdf_url, timeout=REST_TIMEOUT).text
-        doc_urls = list(dict.fromkeys(re.findall(
-            r'rdf:resource="(' + re.escape(manif_iri) + r'/DOC_\d+)"',
+        rdf_text = requests.get(location, timeout=REST_TIMEOUT).text
+        doc_urls = re.findall(
+            r'rdf:resource="(' + re.escape(manif_bas) + r'/DOC_\d+)"',
             rdf_text,
-        )))
+        )
     except Exception:
         doc_urls = []
 
     if not doc_urls:
-        doc_urls = [f"{manif_iri}/DOC_1"]
+        # Fallback: prova DOC_1 direkt
+        doc_urls = [manif_bas + "/DOC_1"]
 
+    # Steg 3: Hämta alla DOC-items och konkatenera
     texter: list[str] = []
     for doc_url in doc_urls:
         log.info("Hämtar %s", doc_url)
@@ -260,95 +282,15 @@ def _hamta_xhtml_fran_manifestation(manif_iri: str) -> str:
         if r.status_code == 200 and r.text.strip():
             texter.append(r.text)
         elif r.status_code == 404:
-            break
+            break  # Inga fler items
+
+    if not texter:
+        raise ValueError(
+            f"CELLAR returnerade tomt innehåll för {celex} ({lang}). "
+            "Akten kan sakna XHTML-manifestation."
+        )
 
     return "\n".join(texter)
-
-
-def _hitta_xhtml_manifestation_via_sparql(celex: str, lang3: str) -> Optional[str]:
-    """Hittar XHTML-manifestations-IRI via SPARQL (fallback när REST 404:ar).
-
-    Verifierat 2026-05-14: .{CELEX}.{LANG}.xhtml REST-URL ger 404 för
-    nyare/äldre dokument (t.ex. AI-förordningen 32024R1689, GDPR 32016R0679)
-    trots att xhtml-manifestation finns i CELLAR. SPARQL hittar rätt IRI.
-    Manifestationerna indexeras som .0024.NN — siffran varierar per dokument.
-    """
-    lang_uri = f"http://publications.europa.eu/resource/authority/language/{lang3}"
-    query = f"""PREFIX cdm: <http://publications.europa.eu/ontology/cdm#>
-SELECT ?manif WHERE {{
-  ?work cdm:resource_legal_id_celex ?c .
-  FILTER(STR(?c) = "{celex}")
-  ?expr cdm:expression_belongs_to_work ?work ;
-        cdm:expression_uses_language <{lang_uri}> .
-  ?manif cdm:manifestation_manifests_expression ?expr ;
-         cdm:manifestation_type ?type .
-  FILTER(CONTAINS(LCASE(STR(?type)), "xhtml"))
-}} LIMIT 1"""
-    try:
-        rader = _kora_sparql(query)
-        if rader:
-            # _kora_sparql extraherar redan .value — rader[0]["manif"] är en sträng
-            return rader[0]["manif"]
-    except Exception as exc:
-        log.warning("SPARQL-manifestationssökning misslyckades för %s/%s: %s",
-                    celex, lang3, exc)
-    return None
-
-
-def _hamta_xhtml(celex: str, sprak: str) -> str:
-    """Hämtar XHTML-fulltext för en EU-rättsakt via CELLAR.
-
-    Protokoll (verifierat 2026-05-14):
-
-    Primär väg — REST {CELEX}.{LANG}.xhtml → HTTP 303 → manifestation UUID:
-      Fungerar för en delmängd dokument (t.ex. NIS2 32022L2555).
-
-    Fallback — SPARQL manifestationssökning:
-      För nyare/äldre dokument (t.ex. AI-akten 32024R1689, GDPR 32016R0679)
-      ger REST-URL:en 404 trots att xhtml-manifestation finns. SPARQL hittar
-      rätt manifestations-IRI direkt (cdm:manifestation_type = "xhtml").
-
-    Språkfallback-kedja: begärt språk → ENG → FRA → SWE.
-    """
-    lang = _normalisera_sprak(sprak)
-
-    # Bygg fallback-lista: begärt språk + ENG + FRA + SWE (om inte redan med)
-    sprak_kedja = [lang]
-    for fb in ("ENG", "FRA", "SWE"):
-        if fb not in sprak_kedja:
-            sprak_kedja.append(fb)
-
-    for forsok_lang in sprak_kedja:
-        # --- Primär väg: REST .xhtml ---
-        manifest_url = f"{CELLAR_REST_BASE}/{celex}.{forsok_lang}.xhtml"
-        log.info("Hämtar CELLAR manifestation (REST): %s", manifest_url)
-        r1 = requests.get(manifest_url, timeout=REST_TIMEOUT, allow_redirects=False)
-
-        if r1.status_code == 303:
-            location = r1.headers.get("Location", "")
-            if "/rdf/object/full" in location:
-                manif_bas = location.replace("/rdf/object/full", "")
-                texter = _hamta_xhtml_fran_manifestation(manif_bas)
-                if texter:
-                    log.info("Hämtade %s via REST (lang=%s)", celex, forsok_lang)
-                    return texter
-
-        # --- Fallback: SPARQL-baserad manifestationssökning ---
-        log.info("REST 404/tom för %s.%s — provar SPARQL-manifestation",
-                 celex, forsok_lang)
-        manif_iri = _hitta_xhtml_manifestation_via_sparql(celex, forsok_lang)
-        if manif_iri:
-            texter = _hamta_xhtml_fran_manifestation(manif_iri)
-            if texter:
-                log.info("Hämtade %s via SPARQL-manifestation (lang=%s)",
-                         celex, forsok_lang)
-                return texter
-
-    raise ValueError(
-        f"Ingen XHTML-manifestation hittades för {celex} på {sprak} "
-        f"(provade: {', '.join(sprak_kedja)}). "
-        "Kontrollera CELEX-numret eller att akten har XHTML i CELLAR."
-    )
 
 
 def _rensa_html(html: str) -> str:
@@ -370,11 +312,9 @@ def _trunkera(text: str, max_tecken: int = MAX_TECKEN) -> str:
         return text
     return (
         text[:max_tecken]
-        + f"\n\n[VARNING: Texten är trunkerad vid {max_tecken:,} tecken. "
-          f"Originaldokumentet är {len(text):,} tecken — innehållet är ofullständigt. "
-          f"Anropa hamta_eu_akt igen med artikel=N för att hämta ett specifikt "
-          f"artikelnummer ur hela dokumentet. Exempel: hamta_eu_akt(celex=..., artikel=4). "
-          f"Ange fraga med användarens fråga för automatisk artikeldetektering.]"
+        + f"\n\n[Trunkerad vid {max_tecken:,} tecken. "
+          f"Originaldokumentet är {len(text):,} tecken. "
+          f"Använd parametern 'artikel' för att hämta ett specifikt artikelnummer.]"
     )
 
 
@@ -410,13 +350,11 @@ def _extrahera_artikel(html: str, artikel_nr: int) -> Optional[str]:
         if len(result) > 20:  # Sanity check — ej tomt
             return result
 
-    # Fallback: sök i ren text efter "Artikel N" i début av rad
-    # OBS: re.MULTILINE + ^ krävs för att inte matcha "artikel N i fördraget"
-    # som förekommer mitt i meningar i skälen.
+    # Fallback: sök i ren text efter "Artikel N\n"
     ren_text = _rensa_html(html)
     monster = re.compile(
-        rf'^(Artikel\s+{artikel_nr}\b.*?)(?=^Artikel\s+\d+\b|\Z)',
-        re.DOTALL | re.MULTILINE,
+        rf'(Artikel\s+{artikel_nr}\b.*?)(?=Artikel\s+\d+\b|\Z)',
+        re.DOTALL | re.IGNORECASE,
     )
     m = monster.search(ren_text)
     if m:
@@ -483,16 +421,9 @@ def _parsera_celex_till_eu_nummer(celex: str) -> Optional[str]:
 
 
 def _hamta_sparql_metadata(celex: str) -> Optional[dict]:
-    """Hämtar titel, datum och ELI för ett CELEX via SPARQL.
-
-    Titeln hämtas med språkfallback SV → EN → FR → (ingen titel).
-    OBS: variabeln måste heta ?typ_uri i BÅDE SELECT och WHERE — annars
-    binder WHERE ?typ_uri men SELECT exponerar den ej och r.get("typ_uri")
-    returnerar alltid None → typ sparas som '' i DB (bugg 2026-05-14).
-    """
-    # Hämta grundmetadata + alla tillgängliga titlar
+    """Hämtar titel, datum och ELI för ett CELEX via SPARQL."""
     query = f"""PREFIX cdm: <http://publications.europa.eu/ontology/cdm#>
-SELECT ?datum ?eli ?typ_uri ?sprak ?titel
+SELECT ?titel ?datum ?eli ?typ
 WHERE {{
   ?work cdm:resource_legal_id_celex ?celex_val ;
         cdm:work_date_document ?datum ;
@@ -501,27 +432,18 @@ WHERE {{
   OPTIONAL {{ ?work cdm:resource_legal_eli ?eli . }}
   OPTIONAL {{
     ?expr cdm:expression_belongs_to_work ?work ;
-          cdm:expression_uses_language ?sprak ;
+          cdm:expression_uses_language
+            <{SPRAK_URIS["SV"]}> ;
           cdm:expression_title ?titel .
-    FILTER(?sprak IN (
-      <{SPRAK_URIS["SV"]}>,
-      <{SPRAK_URIS["EN"]}>,
-      <http://publications.europa.eu/resource/authority/language/FRA>
-    ))
   }}
-}}
-ORDER BY (IF(?sprak = <{SPRAK_URIS["SV"]}>, 0,
-             IF(?sprak = <{SPRAK_URIS["EN"]}>, 1, 2)))
-LIMIT 5"""
+}} LIMIT 1"""
     try:
         rader = _kora_sparql(query)
         if rader:
             r = rader[0]
             typ_kod = (r.get("typ_uri") or "").split("/")[-1]
-            # Välj bästa tillgängliga titel (första raden är prioriterad)
-            titel = r.get("titel")
             return {
-                "titel": titel,
+                "titel": r.get("titel"),
                 "datum": r.get("datum"),
                 "eli":   r.get("eli"),
                 "typ":   typ_kod,
@@ -581,7 +503,7 @@ def _sok_riksdag_propositioner(sok_term: str, max_antal: int = 10) -> list[dict]
 # ---------------------------------------------------------------------------
 
 mcp = FastMCP(
-    "cellar-eu-v2",
+    "cellar-eu-ratt",
     instructions=(
         "MCP-server för EU-rätt via CELLAR. Verktyg: hamta_eu_akt (rättsakter via CELEX), "
         "hamta_eu_mal (domar C-xxx/T-xxx), sok_i_cachade_akter (FTS/semantisk sökning), "
@@ -594,22 +516,17 @@ mcp = FastMCP(
 @mcp.tool(
     name="hamta_eu_akt",
     description=(
-        "Hämtar fulltext för en EU-rättsakt via CELEX-nummer. Cachar lokalt i PostgreSQL "
+        "Hämtar fulltext för en EU-rättsakt via CELEX-nummer. Cachar lokalt i databasen "
         "för framtida sökning. Giltiga CELEX-format: 32006L0054 (direktiv), "
         "32016R0679 (förordning), 32015D1602 (delegerat beslut). "
         "Returnerar titel, datum, ELI och fulltext. "
-        "ARTIKELEXTRAKTION: Frågar användaren om ett specifikt artikelnummer — "
-        "t.ex. 'hur lyder artikel 4', 'vad säger artikel 17 om' — "
-        "ANGE ALLTID artikel=N (t.ex. artikel=4) DIREKT i anropet. "
-        "Stora direktiv (NIS2, GDPR m.fl.) är hundratusentals tecken och trunkeras "
-        "om artikel-parametern utelämnas. Ange också fraga med användarens originalfråga "
-        "så att artikelnumret kan detekteras automatiskt som fallback. "
+        "Använd parametern 'artikel' (heltal) för att hämta ett specifikt artikelnummer — "
+        "viktigt för långa direktiv där hela texten trunkeras. "
         "Prova sprak='EN' om svensk version saknas (pre-1995 akter)."
     ),
 )
 def hamta_eu_akt(celex: str, sprak: str = "SV",
-                 artikel: Optional[int] = None,
-                 fraga: Optional[str] = None) -> dict:
+                 artikel: Optional[int] = None) -> dict:
     """Hämtar och cachar en EU-rättsakt.
 
     Args:
@@ -617,18 +534,8 @@ def hamta_eu_akt(celex: str, sprak: str = "SV",
         sprak:   Önskat språk — 'SV' (standard), 'EN', 'DE', 'FR'.
         artikel: Om satt hämtas bara detta artikelnummer (t.ex. artikel=3).
                  Användbart för långa direktiv där hela texten trunkeras.
-        fraga:   Användarens originalfråga (fritext). Används för att auto-detektera
-                 artikelnummer om artikel-parametern utelämnats.
     """
     celex = celex.strip().upper()
-
-    # Auto-detektera artikelnummer ur fritext om artikel inte angetts
-    if artikel is None and fraga:
-        _art_m = re.search(r'\bartikel\s+(\d+)\b', fraga, re.IGNORECASE)
-        if _art_m:
-            artikel = int(_art_m.group(1))
-            log.info("Auto-detekterade artikel %d ur fråga: %r", artikel, fraga)
-
     log.info("hamta_eu_akt: celex=%s sprak=%s artikel=%s", celex, sprak, artikel)
 
     # Kontrollera cache
@@ -637,12 +544,10 @@ def hamta_eu_akt(celex: str, sprak: str = "SV",
         log.info("Serverar %s från cache", celex)
         fulltext_full = cachad["fulltext_md"]
         if artikel is not None:
-            # Försök extrahera specifikt artikelnummer ur cachad text.
-            # re.MULTILINE + ^ krävs — annars matchar frasen "artikel N i fördraget"
-            # som förekommer mitt i meningar i ingressen/skälen.
+            # Försök extrahera specifikt artikelnummer ur cachad text
             art_text = re.search(
-                rf'^(Artikel\s+{artikel}\b.*?)(?=^Artikel\s+\d+\b|\Z)',
-                fulltext_full, re.DOTALL | re.MULTILINE,
+                rf'(Artikel\s+{artikel}\b.*?)(?=Artikel\s+\d+\b|\Z)',
+                fulltext_full, re.DOTALL | re.IGNORECASE,
             )
             if art_text:
                 return {
@@ -718,10 +623,10 @@ def hamta_eu_akt(celex: str, sprak: str = "SV",
                 "artikel":    artikel,
                 "fulltext":   art_text,
             }
-        # Fallback: sök i ren text — re.MULTILINE + ^ för att undvika skälen
+        # Fallback: sök i ren text
         art_match = re.search(
-            rf'^(Artikel\s+{artikel}\b.*?)(?=^Artikel\s+\d+\b|\Z)',
-            fulltext_full, re.DOTALL | re.MULTILINE,
+            rf'(Artikel\s+{artikel}\b.*?)(?=Artikel\s+\d+\b|\Z)',
+            fulltext_full, re.DOTALL | re.IGNORECASE,
         )
         if art_match:
             return {
@@ -859,8 +764,8 @@ def hamta_eu_mal(malnum: str, sprak: str = "SV") -> dict:
 @mcp.tool(
     name="sok_i_cachade_akter",
     description=(
-        "Söker i fulltext bland lokalt cachade EU-rättsakter med PostgreSQL FTS "
-        "och semantisk sökning (pgvector). "
+        "Söker i fulltext bland lokalt cachade EU-rättsakter. "
+        "PostgreSQL: FTS och semantisk sökning (pgvector). SQLite: LIKE-sökning. "
         "Returnerar bara akter som tidigare hämtats via hamta_eu_akt eller hamta_eu_mal. "
         "Tillgängliga typer: direktiv, forordning, forordning_delegerad, "
         "forordning_genomforande, beslut, dom m.fl. "
@@ -898,9 +803,9 @@ def sok_i_cachade_akter(
     # FTS-sökning
     fts_treffar = db.sok_fts(fraga, typ_kod, ar_fran, ar_till, max_antal)
 
-    # Semantisk sökning om modell är tillgänglig och databas ansluten
+    # Semantisk sökning — kräver PostgreSQL med pgvector (ej SQLite)
     semantiska_treffar: list[dict] = []
-    if db.DATABASE_URL:
+    if db.DATABASE_URL and db._ar_postgres():
         try:
             modell = _hamta_modell()
             vektor = modell.encode(fraga).tolist()
@@ -928,9 +833,8 @@ def sok_i_cachade_akter(
     description=(
         "Söker EU-rättsakter via SPARQL mot CELLAR — hittar akter utan att cacha dem lokalt. "
         "Returnerar lista med CELEX-nummer, titlar och datum att använda med hamta_eu_akt. "
-        "VIKTIGT: Ange sokterm för att söka på nyckelord i titeln (t.ex. sokterm='artificiell intelligens'). "
-        "Utan sokterm returneras de senaste max_antal akterna av vald typ — nyttigt som listning men "
-        "ej som fritextsökning. Titlar hämtas med språkfallback SV→EN→FR automatiskt. "
+        "Kräver att akten finns med svensk titel (titlar på Expression-noden i CDM). "
+        "Pre-1995 akter saknar ofta svenska titlar — ange sprak='EN' i sådana fall. "
         "Tillgängliga typer: direktiv, forordning, forordning_delegerad, "
         "forordning_genomforande, direktiv_delegerat, beslut, beslut_genomforande, "
         "beslut_delegerat, rekommendation, yttrande, dom, beslut_domstol, "
@@ -939,7 +843,6 @@ def sok_i_cachade_akter(
     ),
 )
 def sok_eu_metadata(
-    sokterm: Optional[str] = None,
     typ: Optional[str] = None,
     ar_fran: Optional[int] = None,
     ar_till: Optional[int] = None,
@@ -949,16 +852,13 @@ def sok_eu_metadata(
     """Söker EU-rättsakter via SPARQL (metadatasökning, ingen cachning).
 
     Args:
-        sokterm:   Nyckelord att söka i titeln, t.ex. 'artificiell intelligens'
-                   eller 'halvledare'. Lämna tomt för att lista senaste akter.
         typ:       Dokumenttyp (se lista ovan). Utelämnas för alla typer.
         ar_fran:   Lägsta publiceringsår.
         ar_till:   Högsta publiceringsår.
-        sprak:     Föredraget titelspråk — 'SV' (standard), 'EN', 'FR'.
-                   Fallback till EN och FR om SV saknas.
-        max_antal: Max antal träffar (standard 20, max 100).
+        sprak:     Titelspråk — 'SV' (standard), 'EN', 'FR'.
+        max_antal: Max antal träffar (standard 20, max 50).
     """
-    max_antal = min(int(max_antal), 100)
+    max_antal = min(int(max_antal), 50)
 
     if typ and typ.lower() not in TYP_URIS:
         return {
@@ -967,8 +867,6 @@ def sok_eu_metadata(
         }
 
     sprak_uri = SPRAK_URIS.get(sprak.upper(), SPRAK_URIS["SV"])
-    eng_uri   = SPRAK_URIS["EN"]
-
     typ_filter = ""
     if typ:
         typ_filter = f'?work cdm:work_has_resource-type <{TYP_URIS[typ.lower()]}> .'
@@ -980,65 +878,42 @@ def sok_eu_metadata(
         ar_delar.append(f"YEAR(?datum) <= {ar_till}")
     ar_filter = f"  FILTER({' && '.join(ar_delar)})" if ar_delar else ""
 
-    def _bygg_query(lang_uri: str, term: Optional[str], limit: int) -> str:
-        """Enkel SPARQL-sökning i ett språk (undviker timeout från 3-OPTIONAL-join)."""
-        term_filter = ""
-        if term:
-            escaped = term.replace('"', '\\"')
-            term_filter = f'  FILTER(CONTAINS(LCASE(?titel), LCASE("{escaped}")))'
-        return f"""PREFIX cdm: <http://publications.europa.eu/ontology/cdm#>
+    query = f"""PREFIX cdm: <http://publications.europa.eu/ontology/cdm#>
+
 SELECT DISTINCT ?celex ?titel ?datum ?eli
 WHERE {{
   ?work cdm:resource_legal_id_celex ?celex ;
         cdm:work_date_document ?datum .
   {typ_filter}
+
   ?expr cdm:expression_belongs_to_work ?work ;
-        cdm:expression_uses_language <{lang_uri}> ;
+        cdm:expression_uses_language <{sprak_uri}> ;
         cdm:expression_title ?titel .
+
   OPTIONAL {{ ?work cdm:resource_legal_eli ?eli . }}
 {ar_filter}
-{term_filter}
 }}
 ORDER BY DESC(?datum)
-LIMIT {limit}"""
+LIMIT {max_antal}"""
 
     try:
-        # Sök i primärspråk
-        rader = _kora_sparql(_bygg_query(sprak_uri, sokterm, max_antal))
-
-        # Om sokterm angavs och primärspråket inte är EN — komplettera med EN-sökning
-        # (OBS: CELLAR sparar ofta titlar bara på EN för äldre/icke-publicerade akter)
-        if sokterm and sprak_uri != eng_uri:
-            sett = {r["celex"] for r in rader}
-            komplettering = _kora_sparql(
-                _bygg_query(eng_uri, sokterm, max_antal - len(rader))
-            )
-            for r in komplettering:
-                if r["celex"] not in sett:
-                    rader.append(r)
-                    sett.add(r["celex"])
-
-        # Sortera sammanslagen lista på datum (DESC)
-        rader.sort(key=lambda r: r.get("datum", ""), reverse=True)
-
+        rader = _kora_sparql(query)
     except requests.RequestException as exc:
         return {"fel": f"SPARQL-anrop misslyckades: {exc}"}
 
     return {
-        "antal":   len(rader),
-        "sokterm": sokterm,
-        "typ":     typ,
+        "antal":  len(rader),
+        "typ":    typ,
         "ar_fran": ar_fran,
         "ar_till": ar_till,
         "treffar": [
-            {"celex": r["celex"], "titel": r.get("titel"),
+            {"celex": r["celex"], "titel": r["titel"],
              "datum": r["datum"], "eli": r.get("eli")}
-            for r in rader[:max_antal]
+            for r in rader
         ],
         "tips": (
-            "Utan sokterm returneras de senaste akterna av vald typ. "
-            "Med sokterm söks i titlar på begärt språk + engelska. "
-            "Använd hamta_eu_akt(celex) för att hämta fulltext och indexera."
+            "Använd hamta_eu_akt(celex) för att hämta fulltext "
+            "och indexera akten för framtida sökning."
         ),
     }
 
@@ -1065,71 +940,50 @@ def hitta_nationellt_genomforande(
         medlemsstat: ISO-3-kod, t.ex. 'SWE', 'DEU', 'FRA'. Tom = alla länder.
     """
     celex = celex.strip().upper()
-
-    # Bygg landfilter — korrekt predicat: measure_national_implementing_implemented_by_country
-    # Lands-URI-format: http://publications.europa.eu/resource/authority/country/{ISO3}
     stat_filter = ""
     if medlemsstat:
         stat_kod = medlemsstat.strip().upper()
-        stat_uri = (
-            STAT_URIS.get(stat_kod)
-            or f"http://publications.europa.eu/resource/authority/country/{stat_kod}"
-        )
-        stat_filter = (
-            f"  ?genomf cdm:measure_national_implementing_implemented_by_country "
-            f"<{stat_uri}> ."
-        )
+        stat_uri = STAT_URIS.get(stat_kod)
+        if stat_uri:
+            stat_filter = (
+                f"  ?genomf cdm:member_state_of_publication <{stat_uri}> ."
+            )
+        else:
+            stat_filter = f"""  ?genomf cdm:member_state_of_publication ?stat .
+  FILTER(STR(?stat) = "http://publications.europa.eu/resource/authority/country/{stat_kod}")"""
 
-    # OBS: Korrekta CDM-predicat för genomförandeåtgärder (verifierade 2026-05-14):
-    #   - measure_national_implementing_implements_resource_legal  (länk direktiv → genomförande)
-    #   - measure_national_implementing_implemented_by_country     (land)
-    #   - measure_national_implementing_date_notification          (notifieringsdatum)
-    #   - measure_national_implementing_date_official_journal      (OJ-datum)
-    #   - measure_national_implementing_number_official_journal    (OJ-nummer/SFS-nummer)
-    #   - measure_national_implementing_name_official_journal      (OJ-namn, t.ex. "Retsinformation")
-    # Landet extraheras ur ?stat_uri, INTE ur cdm:member_state_of_publication.
     query = f"""PREFIX cdm: <http://publications.europa.eu/ontology/cdm#>
 
-SELECT DISTINCT ?genomf_celex ?stat_uri ?titel ?datum_not ?datum_oj ?oj_nummer ?oj_namn
+SELECT DISTINCT ?genomf_celex ?stat ?titel ?datum
 WHERE {{
   ?direktiv cdm:resource_legal_id_celex ?dir_celex .
   FILTER(STR(?dir_celex) = "{celex}")
 
-  ?genomf cdm:measure_national_implementing_implements_resource_legal ?direktiv ;
-          cdm:resource_legal_id_celex ?genomf_celex .
+  ?genomf cdm:resource_legal_implements_resource_legal ?direktiv ;
+          cdm:resource_legal_id_celex ?genomf_celex ;
+          cdm:work_date_document ?datum .
 {stat_filter}
-  OPTIONAL {{ ?genomf cdm:measure_national_implementing_implemented_by_country ?stat_uri . }}
-  OPTIONAL {{ ?genomf cdm:measure_national_implementing_date_notification ?datum_not . }}
-  OPTIONAL {{ ?genomf cdm:measure_national_implementing_date_official_journal ?datum_oj . }}
-  OPTIONAL {{ ?genomf cdm:measure_national_implementing_number_official_journal ?oj_nummer . }}
-  OPTIONAL {{ ?genomf cdm:measure_national_implementing_name_official_journal ?oj_namn . }}
+  OPTIONAL {{ ?genomf cdm:member_state_of_publication ?stat . }}
   OPTIONAL {{
     ?genomf_expr cdm:expression_belongs_to_work ?genomf ;
                  cdm:expression_title ?titel .
   }}
 }}
-ORDER BY ?stat_uri ?datum_not
-LIMIT 200"""
+ORDER BY ?stat ?datum
+LIMIT 100"""
 
     cellar_treffar: list[dict] = []
     try:
         rader = _kora_sparql(query)
         for r in rader:
             if r.get("genomf_celex"):
-                stat_kod_resultat = (r.get("stat_uri") or "").split("/")[-1]
-                # Filtrera bort ogiltiga OJ-datum (1001-01-01 = saknas)
-                datum_oj = r.get("datum_oj")
-                if datum_oj and datum_oj.startswith("1001"):
-                    datum_oj = None
+                stat_kod_resultat = (r.get("stat") or "").split("/")[-1]
                 cellar_treffar.append({
-                    "celex":            r["genomf_celex"],
-                    "datum_notifierat": r.get("datum_not"),
-                    "datum_oj":         datum_oj,
-                    "oj_nummer":        r.get("oj_nummer"),
-                    "oj_namn":          r.get("oj_namn"),
-                    "titel":            r.get("titel"),
-                    "medlemsstat":      stat_kod_resultat,
-                    "kalla":            "CELLAR",
+                    "celex":      r["genomf_celex"],
+                    "datum":      r.get("datum"),
+                    "titel":      r.get("titel"),
+                    "medlemsstat": stat_kod_resultat,
+                    "kalla":      "CELLAR",
                 })
     except requests.RequestException as exc:
         log.warning("SPARQL misslyckades för genomförande av %s: %s", celex, exc)
