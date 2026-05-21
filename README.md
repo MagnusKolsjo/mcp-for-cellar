@@ -56,8 +56,8 @@ Lägg till i `claude_desktop_config.json`:
 {
   "mcpServers": {
     "cellar-eu": {
-      "command": "/Users/DITTNAMN/MCP-Servers/cellar-eu/.venv/bin/python3",
-      "args": ["/Users/DITTNAMN/MCP-Servers/cellar-eu/mcp_server.py"]
+      "command": "~/MCP-Servers/cellar-eu/.venv/bin/python3",
+      "args": ["~/MCP-Servers/cellar-eu/mcp_server.py"]
     }
   }
 }

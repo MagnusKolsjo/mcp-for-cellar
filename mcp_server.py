@@ -148,7 +148,7 @@ def _hamta_modell():
     return _modell
 
 # ---------------------------------------------------------------------------
-# Konstanter: verifierade typ-URI:er (session 19)
+# Konstanter: typ-URI:er verifierade mot live CELLAR
 # ---------------------------------------------------------------------------
 
 BASE_TYP = "http://publications.europa.eu/resource/authority/resource-type/"
@@ -225,6 +225,10 @@ _CDM_FORMAT_MAP: dict[str, str] = {
     "PDF":    "pdf",
     "PDFA1A": "pdf",
     "PDFA1B": "pdf",
+    "PDFA2A": "pdf",
+    "PDFA2B": "pdf",
+    "PDFA3A": "pdf",
+    "PDFA3B": "pdf",
 }
 
 STAT_URIS: dict[str, str] = {
@@ -241,6 +245,39 @@ STAT_URIS: dict[str, str] = {
     "ESP": "http://publications.europa.eu/resource/authority/country/ESP",
     "POL": "http://publications.europa.eu/resource/authority/country/POL",
     "HUN": "http://publications.europa.eu/resource/authority/country/HUN",
+}
+
+# Normalisering av tvåbokstavs ISO 3166-1 alpha-2 → trebokstavs ISO 639-2/T
+# som CELLAR använder. Användare kan ange t.ex. "SE" och "SVE" utöver "SWE".
+_NORMALISERA_LAND: dict[str, str] = {
+    "SE":  "SWE", "SVE": "SWE",
+    "DE":  "DEU",
+    "FR":  "FRA",
+    "DK":  "DNK",
+    "NO":  "NOR",
+    "FI":  "FIN",
+    "NL":  "NLD",
+    "BE":  "BEL",
+    "AT":  "AUT",
+    "IT":  "ITA",
+    "ES":  "ESP",
+    "PL":  "POL",
+    "HU":  "HUN",
+    "PT":  "PRT",
+    "CZ":  "CZE",
+    "SK":  "SVK",
+    "RO":  "ROU",
+    "BG":  "BGR",
+    "HR":  "HRV",
+    "SI":  "SVN",
+    "EE":  "EST",
+    "LV":  "LVA",
+    "LT":  "LTU",
+    "LU":  "LUX",
+    "CY":  "CYP",
+    "MT":  "MLT",
+    "IE":  "IRL",
+    "EL":  "GRC", "GR": "GRC",
 }
 
 # ---------------------------------------------------------------------------
@@ -289,6 +326,16 @@ def _kora_sparql(query: str) -> list[dict]:
     return rader
 
 
+def _sparql_escape(s: str) -> str:
+    """Escapar en sträng för inbäddning i SPARQL-literaler.
+
+    Ersätter bakåtsnedstreck och citattecken för att förhindra
+    att användarinput bryter ut ur SPARQL-strängliteraler.
+    Appliceras på alla interpolerade värden i SPARQL-frågor.
+    """
+    return s.replace("\\", "\\\\").replace('"', '\\"')
+
+
 def _sok_cellar_manifestationer(celex: str, sprak: str) -> list[str]:
     """Frågar CELLAR via SPARQL om vilka manifestationstyper som finns.
 
@@ -309,7 +356,7 @@ def _sok_cellar_manifestationer(celex: str, sprak: str) -> list[str]:
 SELECT DISTINCT ?manif_type
 WHERE {{
   ?work cdm:resource_legal_id_celex ?celex_val .
-  FILTER(STR(?celex_val) = "{celex}")
+  FILTER(STR(?celex_val) = "{_sparql_escape(celex)}")
 
   ?expr cdm:expression_belongs_to_work ?work ;
         cdm:expression_uses_language <{sprak_uri}> .
@@ -455,10 +502,11 @@ def _hamta_cellar_text(celex: str, sprak: str) -> tuple[str, str]:
 
     # Fallback 4: EUR-Lex direktlänk — täcker originaltexter som saknar CELLAR-manifestation
     _eurlex_headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (compatible; CELLAR-EU-MCP/1.0; "
-            "+https://github.com/MagnusKolsjo)"
-        )
+        # EUR-Lex har historiskt krävt Mozilla-prefixad UA — den gamla strängen
+        # `Mozilla/5.0 (compatible; CELLAR-EU-MCP/1.0; ...)` verifierades fungera
+        # 2026-05-18. compatible-syntax behålls med nya repo-namnet så vi följer
+        # projektets UA-konvention så långt EUR-Lex tillåter.
+        "User-Agent": "Mozilla/5.0 (compatible; mcp-for-cellar/1.0; +https://github.com/MagnusKolsjo/mcp-for-cellar)"
     }
 
     def _hamta_eurlex_html(url: str) -> Optional[str]:
@@ -566,11 +614,14 @@ def _extrahera_artikel(html: str, artikel_nr: int) -> Optional[str]:
         if len(result) > 20:  # Sanity check — ej tomt
             return result
 
-    # Fallback: sök i ren text efter "Artikel N\n"
+    # Fallback: sök i ren text efter "Artikel N" i rad-inledning.
+    # re.MULTILINE krävs för att ^-ankaret ska matcha radstarter,
+    # inte bara dokumentets början — annars träffar recitaler som
+    # "...artikel 5 i fördraget..." istället för normativa artiklar.
     ren_text = _rensa_html(html)
     monster = re.compile(
-        rf'(Artikel\s+{artikel_nr}\b.*?)(?=Artikel\s+\d+\b|\Z)',
-        re.DOTALL | re.IGNORECASE,
+        rf'^(Artikel\s+{artikel_nr}\b.*?)(?=^Artikel\s+\d+\b|\Z)',
+        re.DOTALL | re.IGNORECASE | re.MULTILINE,
     )
     m = monster.search(ren_text)
     if m:
@@ -582,7 +633,13 @@ def _extrahera_artikel(html: str, artikel_nr: int) -> Optional[str]:
 
 
 def _chunka_text(text: str, max_ord: int = 400) -> list[str]:
-    """Delar upp text i semantiska chunks om max max_ord ord."""
+    """Delar upp text i semantiska chunks om max max_ord ord.
+
+    EU-rättsakter är ovanligt långa och innehåller tät normativ text där
+    ett stycke ofta refererar till nästa. 400 ord (~2 400–3 200 tecken) per
+    chunk ger bättre semantisk kontext än projektstandarden 800 tecken —
+    ett medvetet avsteg motiverat av domänens dokumentstruktur.
+    """
     stycken = [s.strip() for s in text.split("\n\n") if s.strip()]
     chunks, aktuell, raknare = [], [], 0
     for stycke in stycken:
@@ -644,7 +701,7 @@ WHERE {{
   ?work cdm:resource_legal_id_celex ?celex_val ;
         cdm:work_date_document ?datum ;
         cdm:work_has_resource-type ?typ_uri .
-  FILTER(STR(?celex_val) = "{celex}")
+  FILTER(STR(?celex_val) = "{_sparql_escape(celex)}")
   OPTIONAL {{ ?work cdm:resource_legal_eli ?eli . }}
   OPTIONAL {{
     ?expr cdm:expression_belongs_to_work ?work ;
@@ -682,14 +739,22 @@ def _indexera_akt(celex: str, sprak: str, fulltext: str,
         modell = _hamta_modell()
         chunks = _chunka_text(fulltext)
         if chunks:
-            embeddings = [modell.encode(c).tolist() for c in chunks]
+            embeddings = modell.encode(
+                chunks, batch_size=8, convert_to_numpy=True,
+            ).tolist()
             db.spara_chunks(celex, chunks, embeddings)
     except Exception as exc:
         log.warning("Embedding misslyckades för %s: %s", celex, exc)
 
 
-def _sok_riksdag_propositioner(sok_term: str, max_antal: int = 10) -> list[dict]:
-    """Söker riksdagens öppna data efter propositioner som nämner söktermen."""
+def _sok_riksdag_propositioner(sok_term: str, max_antal: int = 5) -> list[dict]:
+    """Söker riksdagens öppna data efter propositioner som nämner söktermen.
+
+    Filtrerar resultaten så att bara propositioner vars rubrik innehåller
+    söktermen (direktivnumret, t.ex. "2006/54") inkluderas — förhindrar
+    irrelevanta träffar där söktermen förekommer i brödtext men inte gäller
+    just detta direktiv.
+    """
     svar = requests.get(
         "https://data.riksdagen.se/dokumentlista/",
         params={"doktyp": "prop", "sok": sok_term, "format": "json",
@@ -702,15 +767,21 @@ def _sok_riksdag_propositioner(sok_term: str, max_antal: int = 10) -> list[dict]
     if isinstance(dok_lista, dict):
         dok_lista = [dok_lista]
     resultat = []
-    for dok in dok_lista[:max_antal]:
+    for dok in dok_lista:
+        rubrik = dok.get("titel", "")
+        # Inkludera bara propositioner vars rubrik innehåller direktivnumret
+        if sok_term not in rubrik:
+            continue
         beteckning = dok.get("beteckning", "")
         resultat.append({
             "beteckning": beteckning,
-            "rubrik": dok.get("titel", ""),
+            "rubrik": rubrik,
             "datum":  dok.get("datum", ""),
             "url": f"https://www.riksdagen.se/sv/dokument-lagar/dokument/{dok.get('typ','prop')}/{beteckning}",
             "kalla": "Riksdagen",
         })
+        if len(resultat) >= max_antal:
+            break
     return resultat
 
 
@@ -760,10 +831,11 @@ def hamta_eu_akt(celex: str, sprak: str = "SV",
         log.info("Serverar %s från cache", celex)
         fulltext_full = cachad["fulltext_md"]
         if artikel is not None:
-            # Försök extrahera specifikt artikelnummer ur cachad text
+            # Försök extrahera specifikt artikelnummer ur cachad text.
+            # ^-ankare + re.MULTILINE förhindrar recital-träffar.
             art_text = re.search(
-                rf'(Artikel\s+{artikel}\b.*?)(?=Artikel\s+\d+\b|\Z)',
-                fulltext_full, re.DOTALL | re.IGNORECASE,
+                rf'^(Artikel\s+{artikel}\b.*?)(?=^Artikel\s+\d+\b|\Z)',
+                fulltext_full, re.DOTALL | re.IGNORECASE | re.MULTILINE,
             )
             if art_text:
                 return {
@@ -842,10 +914,11 @@ def hamta_eu_akt(celex: str, sprak: str = "SV",
                     "artikel":    artikel,
                     "fulltext":   art_text,
                 }
-        # Fallback för alla format: regex i klartext
+        # Fallback för alla format: regex i klartext.
+        # ^-ankare + re.MULTILINE förhindrar recital-träffar.
         art_match = re.search(
-            rf'(Artikel\s+{artikel}\b.*?)(?=Artikel\s+\d+\b|\Z)',
-            fulltext_full, re.DOTALL | re.IGNORECASE,
+            rf'^(Artikel\s+{artikel}\b.*?)(?=^Artikel\s+\d+\b|\Z)',
+            fulltext_full, re.DOTALL | re.IGNORECASE | re.MULTILINE,
         )
         if art_match:
             return {
@@ -1119,7 +1192,7 @@ def sok_eu_metadata(
     # Bygg FILTER-villkor för titelsökning (OR per term)
     if alla_termer:
         or_villkor = " || ".join(
-            f'CONTAINS(LCASE(STR(?titel)), LCASE("{t}"))'
+            f'CONTAINS(LCASE(STR(?titel)), LCASE("{_sparql_escape(t)}"))'
             for t in alla_termer
         )
         titel_filter = f"  FILTER({or_villkor})"
@@ -1191,30 +1264,39 @@ def hitta_nationellt_genomforande(
         medlemsstat: ISO-3-kod, t.ex. 'SWE', 'DEU', 'FRA'. Tom = alla länder.
     """
     celex = celex.strip().upper()
+    # ISO-normalisering tillämpas av anroparen (Bg3) — celex är redan rensat.
     stat_filter = ""
     if medlemsstat:
-        stat_kod = medlemsstat.strip().upper()
+        stat_kod = _NORMALISERA_LAND.get(
+            medlemsstat.strip().upper(), medlemsstat.strip().upper()
+        )
         stat_uri = STAT_URIS.get(stat_kod)
+        # Korrekta MEAS_NATION_IMPL-predikat verifierade mot live CELLAR.
         if stat_uri:
             stat_filter = (
-                f"  ?genomf cdm:member_state_of_publication <{stat_uri}> ."
+                f"  ?genomf cdm:measure_national_implementing_implemented_by_country"
+                f" <{stat_uri}> ."
             )
         else:
-            stat_filter = f"""  ?genomf cdm:member_state_of_publication ?stat .
-  FILTER(STR(?stat) = "http://publications.europa.eu/resource/authority/country/{stat_kod}")"""
+            stat_filter = (
+                f"  ?genomf cdm:measure_national_implementing_implemented_by_country"
+                f" ?stat .\n"
+                f'  FILTER(STR(?stat) = "http://publications.europa.eu/resource/'
+                f'authority/country/{_sparql_escape(stat_kod)}")'
+            )
 
     query = f"""PREFIX cdm: <http://publications.europa.eu/ontology/cdm#>
 
 SELECT DISTINCT ?genomf_celex ?stat ?titel ?datum
 WHERE {{
   ?direktiv cdm:resource_legal_id_celex ?dir_celex .
-  FILTER(STR(?dir_celex) = "{celex}")
+  FILTER(STR(?dir_celex) = "{_sparql_escape(celex)}")
 
-  ?genomf cdm:resource_legal_implements_resource_legal ?direktiv ;
+  ?genomf cdm:measure_national_implementing_implements_resource_legal ?direktiv ;
           cdm:resource_legal_id_celex ?genomf_celex ;
           cdm:work_date_document ?datum .
 {stat_filter}
-  OPTIONAL {{ ?genomf cdm:member_state_of_publication ?stat . }}
+  OPTIONAL {{ ?genomf cdm:measure_national_implementing_implemented_by_country ?stat . }}
   OPTIONAL {{
     ?genomf_expr cdm:expression_belongs_to_work ?genomf ;
                  cdm:expression_title ?titel .
@@ -1239,12 +1321,14 @@ LIMIT 100"""
     except requests.RequestException as exc:
         log.warning("SPARQL misslyckades för genomförande av %s: %s", celex, exc)
 
-    # Riksdag-sökning som komplement för Sverige
+    # Riksdag-sökning som komplement för Sverige.
+    # Normalisera eventuell 2-bokstavs-kod så att "SE" också matchar.
     riksdag_treffar: list[dict] = []
-    ska_soka_riksdag = (
-        not medlemsstat
-        or medlemsstat.strip().upper() in ("SWE", "SVE", "SE")
+    normaliserad_stat = (
+        _NORMALISERA_LAND.get(medlemsstat.strip().upper(), medlemsstat.strip().upper())
+        if medlemsstat else None
     )
+    ska_soka_riksdag = not normaliserad_stat or normaliserad_stat == "SWE"
     if ska_soka_riksdag:
         eu_nummer = _parsera_celex_till_eu_nummer(celex)
         if eu_nummer:
@@ -1292,6 +1376,10 @@ if __name__ == "__main__":
         # Förladda embeddingmodell i HTTP-läge
         _hamta_modell()
 
+        # OBS: db.py använder per-anrops-anslutningar som är korrekta för
+        # stdio-transport. Vid HTTP-deployment med flera samtidiga klienter
+        # bör psycopg2.pool.ThreadedConnectionPool läggas till i db.py
+        # för att undvika att varje anrop öppnar en ny PG-anslutning.
         app = Starlette()
         app.add_middleware(BearerTokenMiddleware)
         app.mount("/", mcp.get_asgi_app())

@@ -1,5 +1,37 @@
 # Ändringslogg
 
+## [1.1.0] — 2026-05-21
+
+### Rättat
+- **B1** Artikel-regex: lade till `^`-ankare och `re.MULTILINE` på tre ställen i
+  `_extrahera_artikel`, `hamta_eu_akt` (cache) och `hamta_eu_akt` (ny text) —
+  förhindrar recital-träffar som "artikel 5 i fördraget" i stället för normativa artiklar
+- **B2** `hitta_nationellt_genomforande`: bytte ut felaktiga SPARQL-predikat mot korrekta
+  MEAS_NATION_IMPL-predikat (`measure_national_implementing_implements_resource_legal` och
+  `measure_national_implementing_implemented_by_country`) på fyra ställen — regression från commit 51cd153
+- **B3** `sok_semantisk` i `db.py`: rättade parameter-ordning i SQL-anropet —
+  `[vektor] + filter_värden + [vektor, max_antal]`; semantisk sökning med filter
+  gav tidigare alltid tom lista
+
+### Förbättrat
+- **Bg1** SPARQL-injection: ny hjälpfunktion `_sparql_escape()` applicerad på alla
+  ställen där användarinput interpoleras i SPARQL-frågor
+- **Bg2** `_sok_riksdag_propositioner`: max 5 träffar (var 10), filtrerar nu på
+  direktivnumret i rubrik för högre precision
+- **Bg3** `hitta_nationellt_genomforande`: ny `_NORMALISERA_LAND`-mapping — tvåbokstavs
+  ISO 3166-1 (t.ex. "SE", "DE") normaliseras till trebokstavs koder som CELLAR kräver
+- **K7** `_CDM_FORMAT_MAP`: lade till PDF/A 2 och 3 (PDFA2A, PDFA2B, PDFA3A, PDFA3B)
+- **K8** Batch-embedding i `_indexera_akt`: `modell.encode(chunks, batch_size=8)` i
+  stället för per-chunk-anrop
+
+### Dokumentation
+- **K1** Terminologi: "SQLite-fallback" → "SQLite-alternativ" i config och changelog
+- **K2** `README.md`: `/Users/DITTNAMN/...` → `~/MCP-Servers/cellar-eu/` i config-exempel
+- **K3** `config.example.env`: verklighetstroende platshållare ersatta med `<...>`-syntax
+- **K4** Intern projektreferens borttagen ur kodkommentar
+- **K5** `_chunka_text`: kommentar som förklarar medvetet avsteg från chunkstandarden
+- **K6** HTTP-transport: kommentar om connection pool som uppgraderingsspår
+
 ## [1.0.0] — 2026-05-15
 
 ### Tillagt
@@ -17,7 +49,7 @@
 ## [0.2.0] — 2026-05-14
 
 ### Tillagt
-- SQLite-fallback för miljöer utan PostgreSQL
+- SQLite-alternativ för miljöer utan PostgreSQL
 - `.gitignore`-fix: exkluderar `*.db` och `__pycache__`
 
 ## [0.1.0] — 2026-05-13

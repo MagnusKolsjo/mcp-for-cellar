@@ -347,20 +347,24 @@ def sok_semantisk(vektor: list[float], typ: Optional[str],
         chunk_tab = _prefix("akt_chunks")
 
         join_villkor: list[str] = []
-        parametrar: list = []
+        filter_varden: list = []
 
         if typ:
             join_villkor.append("a.typ = %s")
-            parametrar.append(typ)
+            filter_varden.append(typ)
         if ar_fran:
             join_villkor.append("EXTRACT(YEAR FROM a.datum) >= %s")
-            parametrar.append(ar_fran)
+            filter_varden.append(ar_fran)
         if ar_till:
             join_villkor.append("EXTRACT(YEAR FROM a.datum) <= %s")
-            parametrar.append(ar_till)
+            filter_varden.append(ar_till)
 
         where = ("AND " + " AND ".join(join_villkor)) if join_villkor else ""
-        parametrar += [vektor, max_antal]
+
+        # Parameterlistan måste matcha SQL-platshallarnas ordning:
+        # %s::vector (likhet-uttrycket i SELECT) → filtervillkoren i WHERE
+        # → %s::vector (ORDER BY) → %s (LIMIT).
+        params = [vektor] + filter_varden + [vektor, max_antal]
 
         with _cursor(conn) as cur:
             cur.execute(
@@ -372,7 +376,7 @@ def sok_semantisk(vektor: list[float], typ: Optional[str],
                     WHERE c.embedding IS NOT NULL {where}
                     ORDER BY c.embedding <=> %s::vector
                     LIMIT %s""",
-                parametrar[:-1] + [vektor] + [max_antal],
+                params,
             )
             rader = cur.fetchall()
 
