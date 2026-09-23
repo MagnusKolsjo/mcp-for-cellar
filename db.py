@@ -230,6 +230,25 @@ def hamta_cachad_akt(celex: str) -> Optional[dict]:
             conn.close()
 
 
+def lista_cachade_akter() -> list[tuple[str, str]]:
+    """Returnerar (celex, fulltext) för alla cachade akter med text.
+
+    Används för omindexering av chunkar, t.ex. när chunkningen ändrats.
+    """
+    if not DATABASE_URL:
+        return []
+    conn = _hamta_db()
+    try:
+        with _cursor(conn) as cur:
+            cur.execute(
+                f"SELECT celex, fulltext_md FROM {_prefix('akt_cache')} "
+                "WHERE fulltext_md IS NOT NULL ORDER BY celex"
+            )
+            return [(rad[0], rad[1]) for rad in cur.fetchall()]
+    finally:
+        conn.close()
+
+
 def sok_fts(fraga: str, typ: Optional[str], ar_fran: Optional[int],
             ar_till: Optional[int], max_antal: int) -> list[dict]:
     """Söker i cachade akters fulltext.

@@ -25,6 +25,7 @@
 - Embeddings räknas bara när de lagras (PostgreSQL).
 
 ### Tillagt
+- `omindexera_chunkar.py`: delar om cachade akter i chunkar och räknar om embeddings, utan nya anrop mot CELLAR.
 - Felbeskedet när en akt saknas på det begärda språket listar de språk och
   format CELLAR har.
 - PDF hämtas med den PDF-typ CELLAR anger (`application/pdf;type=pdfa1a` m.fl.).
@@ -32,6 +33,12 @@
   riksdagens öppna data misslyckas.
 
 ### Rättat
+- Chunkningen delade på tomrader, som den rensade texten saknar, så varje
+  akt blev en enda chunk och semantisk sökning såg bara aktens början. Nu
+  delas texten i chunks om högst 250 ord (inom embeddingmodellens 384
+  tokens) med 40 ords överlapp, och en artikelrubrik börjar en ny chunk.
+  **Redan cachade akter behåller sina gamla chunkar** tills de omindexeras
+  med `python3 omindexera_chunkar.py` (se README).
 - Sökningen i riksdagens öppna data skickade inte projektets User-Agent.
 - Cachen och direkthämtningen svarar likadant: `artikel` som inte finns ger
   felsvar även från cachen (i stället för hela akten), och artikelrubriker

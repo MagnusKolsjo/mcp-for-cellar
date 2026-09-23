@@ -89,3 +89,18 @@ Lägg till i `claude_desktop_config.json`:
 Servern hämtar dokument on-demand från CELLAR och cachar dem i PostgreSQL (`cellar_eu`-schemat). Sökning sker mot den lokala cachen via PostgreSQL FTS (`plainto_tsquery`) och pgvector IVFFlat (semantisk cosine-sökning med KBLabs svenska BERT-modell). Embeddings skapas vid inläggning i cachen. Cachen håller en språkversion per akt, den senast hämtade; begärs ett annat språk hämtas akten på nytt.
 
 SPARQL-sökning mot `publications.europa.eu/webapi/rdf/sparql` används för metadata-discovery utan att kräva lokal cache.
+
+## Omindexering av chunkar
+
+Chunkar och embeddings skapas när en akt hämtas första gången. Ändras
+chunkningen får redan cachade akter inte de nya chunkarna av sig själva.
+Kör då, med samma `.env` som servern:
+
+```
+python3 omindexera_chunkar.py              # alla cachade akter
+python3 omindexera_chunkar.py 32016R0679   # bara vissa CELEX-nummer
+```
+
+Skriptet läser fulltexten ur cachen och ersätter chunkarna; inget hämtas
+från CELLAR. Med PostgreSQL räknas embeddings om, vilket tar några sekunder
+per akt. Ta gärna en säkerhetskopia av databasen först.

@@ -872,26 +872,55 @@ def _samma_sprak(cachat: Optional[str], sprak2: str) -> bool:
         return False
 
 
-def _chunka_text(text: str, max_ord: int = 400) -> list[str]:
-    """Delar upp text i semantiska chunks om max max_ord ord.
+# Embeddingmodellen (KBLab/sentence-bert-swedish-cased) läser högst 384
+# tokens; resten av en längre chunk kommer aldrig in i vektorn. 250 ord
+# svensk lagtext ryms med marginal. Överlappet gör att en mening som
+# hamnar vid en chunkgräns finns hel i minst en chunk.
+CHUNK_MAX_ORD = 250
+CHUNK_OVERLAPP_ORD = 40
 
-    EU-rättsakter är ovanligt långa och innehåller tät normativ text där
-    ett stycke ofta refererar till nästa. 400 ord (~2 400–3 200 tecken) per
-    chunk ger bättre semantisk kontext än projektstandarden 800 tecken —
-    ett medvetet avsteg motiverat av domänens dokumentstruktur.
+_ARTIKELRUBRIK = re.compile(r"^(?:Artikel|Article)\s+\d+\b", re.IGNORECASE)
+
+
+def _chunka_text(
+    text: str,
+    max_ord: int = CHUNK_MAX_ORD,
+    overlapp: int = CHUNK_OVERLAPP_ORD,
+) -> list[str]:
+    """Delar en akts klartext i chunks om högst max_ord ord.
+
+    Den rensade texten har ett stycke per rad. Stycken samlas tills gränsen
+    nås, och en artikelrubrik börjar en ny chunk när den pågående redan har
+    innehåll, så att artiklar i möjligaste mån hålls samman. Varje ny chunk
+    inleds med de sista `overlapp` orden ur den förra. Stycken som ensamma
+    är längre än gränsen delas på ordnivå.
     """
-    stycken = [s.strip() for s in text.split("\n\n") if s.strip()]
-    chunks, aktuell, raknare = [], [], 0
-    for stycke in stycken:
-        ord_antal = len(stycke.split())
-        if raknare + ord_antal > max_ord and aktuell:
-            chunks.append("\n\n".join(aktuell))
-            aktuell, raknare = [], 0
-        aktuell.append(stycke)
-        raknare += ord_antal
-    if aktuell:
-        chunks.append("\n\n".join(aktuell))
-    return [c for c in chunks if len(c.strip()) > 50]
+    ord_per_stycke: list[list[str]] = []
+    for rad in text.splitlines():
+        ord_ = rad.split()
+        if not ord_:
+            continue
+        # Långa stycken delas i bitar som får plats med överlappet.
+        steg = max_ord - overlapp
+        while len(ord_) > steg:
+            ord_per_stycke.append(ord_[:steg])
+            ord_ = ord_[steg:]
+        ord_per_stycke.append(ord_)
+
+    chunks: list[str] = []
+    aktuell: list[str] = []
+    ny_i_aktuell = 0  # ord i aktuell chunk utöver överlappet
+    for ord_ in ord_per_stycke:
+        artikelstart = bool(_ARTIKELRUBRIK.match(" ".join(ord_[:3])))
+        if ny_i_aktuell and (len(aktuell) + len(ord_) > max_ord or artikelstart):
+            chunks.append(" ".join(aktuell))
+            aktuell = aktuell[-overlapp:] if overlapp and not artikelstart else []
+            ny_i_aktuell = 0
+        aktuell.extend(ord_)
+        ny_i_aktuell += len(ord_)
+    if ny_i_aktuell:
+        chunks.append(" ".join(aktuell))
+    return [c for c in chunks if len(c) > 50]
 
 
 def _parsera_malnum(malnum: str) -> tuple[str, str]:
