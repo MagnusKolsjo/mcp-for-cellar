@@ -60,6 +60,7 @@
 - `pdfplumber` saknades i `requirements.txt`.
 
 ### Borttaget
+- `SPARQLWrapper` ur `requirements.txt`; SPARQL-anropen görs med `requests`.
 - EUR-Lex som hämtväg (TXT/HTML och LexUriServ). All data hämtas från CELLAR,
   den auktoritativa källan som EUR-Lex bygger på. Akter som reserven var till
   för, äldre originalakter utan xhtml, levererar CELLAR som html. Servern

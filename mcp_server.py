@@ -1570,7 +1570,6 @@ def hitta_nationellt_genomforande(
         medlemsstat: ISO-3-kod, t.ex. 'SWE', 'DEU', 'FRA'. Tom = alla länder.
     """
     celex = celex.strip().upper()
-    # ISO-normalisering tillämpas av anroparen (Bg3) — celex är redan rensat.
     stat_filter = ""
     if medlemsstat:
         stat_kod = _NORMALISERA_LAND.get(
