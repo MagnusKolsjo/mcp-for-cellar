@@ -1,6 +1,6 @@
 # cellar-eu — MCP-server för EU-rätt
 
-MCP-server som ger AI-assistenter åtkomst till EU:s rättsliga informationssystem CELLAR/EUR-Lex. Servern hanterar hela EU:s normhierarki — förordningar, direktiv, beslut, domar och nationallt genomförande.
+MCP-server som ger AI-assistenter åtkomst till EU-rätt ur CELLAR, Publikationsbyråns arkiv och den auktoritativa källan bakom EUR-Lex. All data hämtas från CELLAR; EUR-Lex är bara en läsvy för människor och anropas inte av servern. Servern hanterar hela EU:s normhierarki — förordningar, direktiv, beslut, domar och nationallt genomförande.
 
 ## Tillgängliga verktyg
 
@@ -28,12 +28,12 @@ Texten hämtas från CELLAR genom innehållsförhandling:
 `GET http://publications.europa.eu/resource/celex/{CELEX}` med `Accept`
 (`application/xhtml+xml`, `text/html` eller `application/pdf;type=...`) och
 `Accept-Language` (trebokstavskod, t.ex. `swe`). CELLAR svarar 303 till
-dokumentet. Räcker inte det provas den äldre vägen `{CELEX}.{SPRÅK}.{format}`
-och sist EUR-Lex. EUR-Lex ligger bakom AWS WAF; svarar det med en utmaning
-(202 och `x-amzn-waf-action`) avbryts försöket i stället för att upprepas.
+dokumentet. Äldre akter (t.ex. 31958R0001) finns bara som html och hämtas
+på samma sätt. Räcker inte det provas den äldre vägen `{CELEX}.{SPRÅK}.{format}`.
 
 Finns akten inte på det begärda språket säger felbeskedet vilka språk och
-format CELLAR har. Servern identifierar sig med en egen User-Agent
+format CELLAR har, och saknar CELLAR text helt säger felbeskedet det.
+Servern identifierar sig med en egen User-Agent
 (`CELLAR_USER_AGENT`) och ser aldrig ut som en webbläsare.
 
 ## Förutsättningar

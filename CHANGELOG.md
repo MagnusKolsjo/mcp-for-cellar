@@ -14,7 +14,7 @@
   ger felsvar när CELLAR-frågan misslyckas i stället för en tom lista.
 - Texten hämtas i första hand genom innehållsförhandling mot
   `publications.europa.eu/resource/celex/{CELEX}` (`Accept`, `Accept-Language`).
-  Den äldre vägen `{CELEX}.{SPRÅK}.{format}` provas därefter och EUR-Lex sist.
+  Den äldre vägen `{CELEX}.{SPRÅK}.{format}` provas därefter.
 - Tribunalens och Personaldomstolens avgöranden hämtas med fulltext som
   EU-domstolens, i stället för enbart metadata.
 - Alla verktyg har titel, annotationer och utdataschema (`outputSchema`).
@@ -35,8 +35,6 @@
 - http-läget startade inte (anropade `mcp.get_asgi_app()`, som inte finns).
 - Texthämtningen gav 404 för bl.a. 32016R0679 och 32024R1689 trots att
   CELLAR har texten.
-- EUR-Lex svar 202 tolkades som pågående rendering och gjordes om. Det är
-  botskyddets utmaning och känns nu igen utan nya försök.
 - Aktens typkod sparades aldrig i cachen, och avgöranden sparades med typen
   `dom`, så typfiltret i `sok_i_cachade_akter` träffade inte nyhämtade akter.
   Redan cachade rader behåller sitt tidigare värde tills akten hämtas om.
@@ -45,6 +43,10 @@
 - `pdfplumber` saknades i `requirements.txt`.
 
 ### Borttaget
+- EUR-Lex som hämtväg (TXT/HTML och LexUriServ). All data hämtas från CELLAR,
+  den auktoritativa källan som EUR-Lex bygger på. Akter som reserven var till
+  för, äldre originalakter utan xhtml, levererar CELLAR som html. Servern
+  anropar därmed inte längre en tjänst bakom botskydd (AWS WAF).
 - `[cli]`-extrat i `mcp`-beroendet, som inte används.
 - Egen Starlette-app och Bearer-middleware; transporten sköts av `mcp_transport.py`.
 

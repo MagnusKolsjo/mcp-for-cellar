@@ -1,5 +1,5 @@
 """
-mcp_server.py — MCP-server för EU-rätt via CELLAR/EUR-Lex.
+mcp_server.py — MCP-server för EU-rätt via CELLAR.
 
 Fem verktyg:
   hamta_eu_akt              — Hämtar en EU-rättsakt via CELEX-nummer (on-demand, cachar i DB)
@@ -12,8 +12,8 @@ Datakällor:
   SPARQL: http://publications.europa.eu/webapi/rdf/sparql
   Text:   http://publications.europa.eu/resource/celex/{CELEX}
           (innehållsförhandling med Accept och Accept-Language)
-  EUR-Lex används bara när CELLAR saknar texten och EUR-Lex svarar med
-  innehåll; dess botskydd respekteras.
+  All data hämtas från CELLAR, Publikationsbyråns auktoritativa arkiv som
+  EUR-Lex bygger på. EUR-Lex anropas aldrig.
 
 Transport styrs via MCP_TRANSPORT i .env: stdio eller http (se mcp_transport.py).
 """
@@ -61,9 +61,8 @@ CELLAR_REST_BASE = os.getenv(
 # och ingår i User-Agent, så att källorna kan se vilken version som anropar.
 VERSION = "1.1.0"
 
-# Projektets egen User-Agent. Den ska aldrig se ut som en webbläsare:
-# källornas botskydd är till för att skilja maskiner från människor, och en
-# ärlig identifiering med kontaktväg är det källorna kan agera på.
+# Projektets egen User-Agent, med kontaktväg. Den ska aldrig se ut som en
+# webbläsare: en ärlig identifiering är det källan kan agera på.
 CELLAR_USER_AGENT = os.getenv(
     "CELLAR_USER_AGENT",
     f"mcp-for-cellar/{VERSION} (+https://github.com/MagnusKolsjo/mcp-for-cellar)",
@@ -248,7 +247,7 @@ SPRAK_URIS: dict[str, str] = {
     "FR": "http://publications.europa.eu/resource/authority/language/FRA",
 }
 
-# EU:s 24 officiella språk. Verktygen och EUR-Lex använder tvåbokstavskoder
+# EU:s 24 officiella språk. Verktygen använder tvåbokstavskoder
 # (ISO 639-1); CELLAR använder trebokstavskoder (ISO 639-2/T) både i
 # språk-URI:erna och i Accept-Language vid innehållsförhandling.
 _SPRAK_3: dict[str, str] = {
@@ -259,9 +258,6 @@ _SPRAK_3: dict[str, str] = {
     "RO": "RON", "SK": "SLK", "SL": "SLV", "SV": "SWE",
 }
 _SPRAK_2: dict[str, str] = {tre: tva for tva, tre in _SPRAK_3.items()}
-
-EURLEX_CONTENT_BASE      = "https://eur-lex.europa.eu/legal-content"
-EURLEX_LEXURISERV_BASE   = "https://eur-lex.europa.eu/LexUriServ/LexUriServ.do"
 
 # Format som går att göra text av, i den ordning de provas. XHTML bär
 # ELI-strukturen (id="art_N") och ger de säkraste artikelutdragen. PDF
@@ -346,8 +342,7 @@ _CELEX_SEKUNDAR = re.compile(r'^3(\d{4})([LRD])0*(\d+)$', re.IGNORECASE)
 # Hjälpfunktioner
 # ---------------------------------------------------------------------------
 
-# En session för alla anrop mot CELLAR, SPARQL-tjänsten, EUR-Lex och
-# riksdagen: återanvända anslutningar och projektets egen User-Agent.
+# En session för alla anrop mot CELLAR, SPARQL-tjänsten och riksdagen: återanvända anslutningar och projektets egen User-Agent.
 # Headers sätts bara här, vid modulinläsning, så att sessionen kan delas
 # mellan verktygsanrop som körs på olika trådar.
 _HTTP = requests.Session()
@@ -359,7 +354,7 @@ _MAX_DELAR = 50
 
 
 class HamtningsFel(Exception):
-    """Förväntat fel vid hämtning från CELLAR eller EUR-Lex.
+    """Förväntat fel vid hämtning från CELLAR.
 
     Meddelandet är skrivet för den som anropar verktyget och förs vidare
     oförändrat till verktygets felsvar.
@@ -625,50 +620,6 @@ def _pdf_till_text(innehall: list[bytes]) -> tuple[Optional[str], str]:
     return "\n".join(delar), "hämtad"
 
 
-def _ar_botskydd(r: requests.Response) -> bool:
-    """Känner igen AWS WAF:s utmaning framför EUR-Lex.
-
-    WAF:en svarar 202 med tom kropp och headern x-amzn-waf-action:
-    challenge när den vill att klienten ska köra JavaScript. Det är en
-    kontroll av webbläsare, inte ett besked om att sidan fortfarande
-    renderas: ett nytt anrop ger samma svar. Servern försöker därför inte
-    igen och försöker inte heller se ut som en webbläsare.
-    """
-    return bool(r.headers.get("x-amzn-waf-action")) or r.status_code == 202
-
-
-def _hamta_eurlex(celex: str, sprak2: str) -> tuple[Optional[str], str]:
-    """Hämtar HTML från EUR-Lex, om EUR-Lex svarar med innehåll.
-
-    Provar TXT/HTML och sedan LexUriServ. Möter första anropet botskyddet
-    görs inget andra, eftersom båda ligger bakom samma WAF.
-    Returnerar (html eller None, notering).
-    """
-    noteringar: list[str] = []
-    for namn, url in (
-        ("TXT/HTML", f"{EURLEX_CONTENT_BASE}/{sprak2}/TXT/HTML/?uri=CELEX:{celex}"),
-        ("LexUriServ", f"{EURLEX_LEXURISERV_BASE}?uri=CELEX:{celex}:{sprak2}:HTML"),
-    ):
-        log.info("Provar EUR-Lex %s: %s", namn, url)
-        try:
-            r = _HTTP.get(url, timeout=REST_TIMEOUT, allow_redirects=True)
-        except requests.RequestException as exc:
-            noteringar.append(f"EUR-Lex {namn}: {type(exc).__name__}")
-            continue
-        log.info("EUR-Lex %s svarade HTTP %d (%d tecken)", namn, r.status_code, len(r.text))
-        if _ar_botskydd(r):
-            noteringar.append(f"EUR-Lex {namn}: blockerat av botskydd (AWS WAF)")
-            break
-        if (
-            r.status_code == 200
-            and r.text.strip()
-            and "The requested document does not exist" not in r.text
-        ):
-            return r.text, "hämtad"
-        noteringar.append(f"EUR-Lex {namn}: HTTP {r.status_code}")
-    return None, "; ".join(noteringar)
-
-
 def _hamta_cellar_text(celex: str, sprak: str, manifest: _Manifestlista) -> tuple[str, str]:
     """Hämtar text för en akt på ett språk. Returnerar (rå_text, format).
 
@@ -682,7 +633,8 @@ def _hamta_cellar_text(celex: str, sprak: str, manifest: _Manifestlista) -> tupl
       3. Innehållsförhandling för PDF, med den PDF-typ CELLAR anger
          (application/pdf;type=pdfa1a o.s.v.).
       4. Den äldre REST-vägen {CELEX}.{SPRÅK}.{format}.
-      5. EUR-Lex, om det svarar med innehåll och inte med botskydd.
+
+    Äldre akter (t.ex. 31958R0001) finns bara som html och hämtas i steg 1.
 
     Kastar CelexOkant, KallaSvararInte, HamtningsFel (okänd språkkod) eller
     _TextSaknas med försöksloggen.
@@ -728,10 +680,6 @@ def _hamta_cellar_text(celex: str, sprak: str, manifest: _Manifestlista) -> tupl
             return "\n".join(c.decode("utf-8", errors="replace") for c in innehall), fmt
         forsok.append(f"REST {fmt}: {notering}")
 
-    text, notering = _hamta_eurlex(celex, sprak2)
-    if text:
-        return text, "html"
-    forsok.append(notering)
     raise _TextSaknas(forsok)
 
 
@@ -743,7 +691,11 @@ def _beskriv_tillgangligt(lista: Optional[dict[str, set[str]]]) -> str:
             "eftersom CELLAR:s SPARQL-tjänst inte svarade."
         )
     if not lista:
-        return "CELLAR har inga digitala versioner av akten på något språk."
+        return (
+            "CELLAR har ingen digital text för akten på något språk, bara "
+            "metadata. Servern hämtar all text från CELLAR och har därför "
+            "ingen text att ge."
+        )
     grupper: dict[tuple[str, ...], list[str]] = {}
     for sprak3, typer in lista.items():
         grupper.setdefault(tuple(sorted(typer)), []).append(_SPRAK_2.get(sprak3, sprak3))
