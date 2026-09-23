@@ -999,7 +999,7 @@ def _sok_riksdag_propositioner(sok_term: str, max_antal: int = 5) -> list[dict]:
     irrelevanta träffar där söktermen förekommer i brödtext men inte gäller
     just detta direktiv.
     """
-    svar = requests.get(
+    svar = _HTTP.get(
         "https://data.riksdagen.se/dokumentlista/",
         params={"doktyp": "prop", "sok": sok_term, "format": "json",
                 "utformat": "json", "a": "s", "p": 1},

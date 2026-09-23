@@ -32,6 +32,7 @@
   riksdagens öppna data misslyckas.
 
 ### Rättat
+- Sökningen i riksdagens öppna data skickade inte projektets User-Agent.
 - Cachen och direkthämtningen svarar likadant: `artikel` som inte finns ger
   felsvar även från cachen (i stället för hela akten), och artikelrubriker
   på engelska och franska (`Article N`) känns igen. Cachen används bara när
