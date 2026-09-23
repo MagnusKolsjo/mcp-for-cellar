@@ -842,22 +842,34 @@ def _extrahera_artikel(html: str, artikel_nr: int) -> Optional[str]:
         if len(result) > 20:  # Sanity check — ej tomt
             return result
 
-    # Fallback: sök i ren text efter "Artikel N" i rad-inledning.
-    # re.MULTILINE krävs för att ^-ankaret ska matcha radstarter,
-    # inte bara dokumentets början — annars träffar recitaler som
-    # "...artikel 5 i fördraget..." istället för normativa artiklar.
-    ren_text = _rensa_html(html)
-    monster = re.compile(
-        rf'^(Artikel\s+{artikel_nr}\b.*?)(?=^Artikel\s+\d+\b|\Z)',
-        re.DOTALL | re.IGNORECASE | re.MULTILINE,
-    )
-    m = monster.search(ren_text)
-    if m:
-        utdrag = m.group(1).strip()
-        if len(utdrag) > 20:
-            return utdrag
+    # Fallback: sök i ren text efter artikelrubriken i radinledning.
+    return _artikel_ur_klartext(_rensa_html(html), artikel_nr)
 
+
+def _artikel_ur_klartext(text: str, artikel_nr: int) -> Optional[str]:
+    """Hittar en artikel i klartext: från rubriken "Artikel N" till nästa artikel.
+
+    ^-ankaret med re.MULTILINE kräver att rubriken står först på raden, så
+    att hänvisningar som "artikel 5 i fördraget" i skälen inte träffas.
+    "Article" täcker engelska och franska, som språkordningen kan landa i.
+    """
+    m = re.search(
+        rf'^((?:Artikel|Article)\s+{artikel_nr}\b.*?)(?=^(?:Artikel|Article)\s+\d+\b|\Z)',
+        text, re.DOTALL | re.IGNORECASE | re.MULTILINE,
+    )
+    if m and len(m.group(1).strip()) > 20:
+        return m.group(1).strip()
     return None
+
+
+def _samma_sprak(cachat: Optional[str], sprak2: str) -> bool:
+    """Om en cachad rads språk motsvarar det begärda (tvåbokstavskod)."""
+    if not cachat:
+        return False
+    try:
+        return _normalisera_sprak(cachat)[0] == sprak2
+    except HamtningsFel:
+        return False
 
 
 def _chunka_text(text: str, max_ord: int = 400) -> list[str]:
@@ -1158,114 +1170,74 @@ def hamta_eu_akt(celex: str, sprak: str = "SV",
     """
     celex = celex.strip().upper()
     log.info("hamta_eu_akt: celex=%s sprak=%s artikel=%s", celex, sprak, artikel)
-
-    # Kontrollera cache
-    cachad = db.hamta_cachad_akt(celex)
-    if cachad and cachad.get("fulltext_md"):
-        log.info("Serverar %s från cache", celex)
-        fulltext_full = cachad["fulltext_md"]
-        if artikel is not None:
-            # Försök extrahera specifikt artikelnummer ur cachad text.
-            # ^-ankare + re.MULTILINE förhindrar recital-träffar.
-            art_text = re.search(
-                rf'^(Artikel\s+{artikel}\b.*?)(?=^Artikel\s+\d+\b|\Z)',
-                fulltext_full, re.DOTALL | re.IGNORECASE | re.MULTILINE,
-            )
-            if art_text:
-                return {
-                    "celex":      cachad["celex"],
-                    "sprak":      cachad["sprak"],
-                    "titel":      cachad["titel"],
-                    "datum":      cachad["datum"],
-                    "eli":        cachad["eli"],
-                    "fran_cache": True,
-                    "artikel":    artikel,
-                    "fulltext":   art_text.group(1).strip(),
-                }
-        return {
-            "celex":      cachad["celex"],
-            "sprak":      cachad["sprak"],
-            "titel":      cachad["titel"],
-            "datum":      cachad["datum"],
-            "eli":        cachad["eli"],
-            "fran_cache": True,
-            "tecken":     len(fulltext_full),
-            "fulltext":   _trunkera(fulltext_full),
-        }
-
-    # Texten hämtas före metadatan: ett okänt CELEX-nummer avslöjas då
-    # redan av första anropet mot CELLAR.
     try:
-        raw, anvant_format, anvant_sprak = _hamta_text_med_sprakordning(
-            celex, [sprak, "EN"],
-        )
+        sprak2, _ = _normalisera_sprak(sprak)
     except HamtningsFel as exc:
         raise ToolError(str(exc)) from exc
 
-    meta = _hamta_sparql_metadata(celex) or {}
-
-    # Konvertera till klartext — full otrunkerad text för cachelagring
-    fulltext_full = _rensa_html(raw) if anvant_format in ("xhtml", "html") else raw
-    _indexera_akt(
-        celex, anvant_sprak,
-        fulltext_full,          # ← full text sparas i DB
-        meta.get("titel"),
-        meta.get("datum"),
-        meta.get("eli"),
-        meta.get("typ"),
-    )
-
-    # Artikel-extraktion om begärd
-    if artikel is not None:
-        # XHTML/HTML: strukturerad extraktion via id-attribut
-        if anvant_format in ("xhtml", "html"):
-            art_text = _extrahera_artikel(raw, artikel)
-            if art_text:
-                return {
-                    "celex":      celex,
-                    "sprak":      anvant_sprak,
-                    "format":     anvant_format,
-                    "titel":      meta.get("titel"),
-                    "datum":      meta.get("datum"),
-                    "eli":        meta.get("eli"),
-                    "fran_cache": False,
-                    "artikel":    artikel,
-                    "fulltext":   art_text,
-                }
-        # Fallback för alla format: regex i klartext.
-        # ^-ankare + re.MULTILINE förhindrar recital-träffar.
-        art_match = re.search(
-            rf'^(Artikel\s+{artikel}\b.*?)(?=^Artikel\s+\d+\b|\Z)',
-            fulltext_full, re.DOTALL | re.IGNORECASE | re.MULTILINE,
+    # Cachen används bara när akten ligger där på det begärda språket;
+    # annars hämtas den på nytt, så att svaret blir detsamma som vid en
+    # direkthämtning. Cachen har en rad per akt, med senast hämtade språk.
+    cachad = db.hamta_cachad_akt(celex)
+    raw: Optional[str] = None
+    anvant_format: Optional[str] = None
+    if cachad and cachad.get("fulltext_md") and _samma_sprak(cachad.get("sprak"), sprak2):
+        log.info("Serverar %s (%s) från cache", celex, sprak2)
+        fulltext_full = cachad["fulltext_md"]
+        anvant_sprak = sprak2
+        meta = {"titel": cachad["titel"], "datum": cachad["datum"], "eli": cachad["eli"]}
+        fran_cache = True
+    else:
+        # Texten hämtas före metadatan: ett okänt CELEX-nummer avslöjas då
+        # redan av första anropet mot CELLAR.
+        try:
+            raw, anvant_format, anvant_sprak = _hamta_text_med_sprakordning(
+                celex, [sprak2, "EN"],
+            )
+        except HamtningsFel as exc:
+            raise ToolError(str(exc)) from exc
+        meta = _hamta_sparql_metadata(celex) or {}
+        # Full otrunkerad text sparas; trunkering sker bara i svaret.
+        fulltext_full = _rensa_html(raw) if anvant_format in ("xhtml", "html") else raw
+        _indexera_akt(
+            celex, anvant_sprak, fulltext_full,
+            meta.get("titel"), meta.get("datum"), meta.get("eli"), meta.get("typ"),
         )
-        if art_match:
-            return {
-                "celex":      celex,
-                "sprak":      anvant_sprak,
-                "format":     anvant_format,
-                "titel":      meta.get("titel"),
-                "datum":      meta.get("datum"),
-                "eli":        meta.get("eli"),
-                "fran_cache": False,
-                "artikel":    artikel,
-                "fulltext":   art_match.group(1).strip(),
-            }
-        raise ToolError(
-            f"Artikel {artikel} hittades inte i {celex}. Kontrollera att "
-            "artikelnumret stämmer, eller hämta hela akten utan parametern artikel."
-        )
+        fran_cache = False
 
-    return {
+    svar: AktSvar = {
         "celex":      celex,
         "sprak":      anvant_sprak,
-        "format":     anvant_format,
         "titel":      meta.get("titel"),
         "datum":      meta.get("datum"),
         "eli":        meta.get("eli"),
-        "fran_cache": False,
-        "tecken":     len(fulltext_full),
-        "fulltext":   _trunkera(fulltext_full),   # ← trunkeras bara vid visning
+        "fran_cache": fran_cache,
+        "fulltext":   "",
     }
+    if anvant_format:
+        svar["format"] = anvant_format
+
+    if artikel is not None:
+        # XHTML/HTML ger strukturerad extraktion via id-attribut; klartexten
+        # (som är det cachen har) söks med samma mönster i båda vägarna.
+        art_text = None
+        if raw is not None and anvant_format in ("xhtml", "html"):
+            art_text = _extrahera_artikel(raw, artikel)
+        if not art_text:
+            art_text = _artikel_ur_klartext(fulltext_full, artikel)
+        if not art_text:
+            raise ToolError(
+                f"Artikel {artikel} hittades inte i {celex} ({anvant_sprak}). "
+                "Kontrollera att artikelnumret stämmer, eller hämta hela akten "
+                "utan parametern artikel."
+            )
+        svar["artikel"] = artikel
+        svar["fulltext"] = art_text
+        return svar
+
+    svar["tecken"] = len(fulltext_full)
+    svar["fulltext"] = _trunkera(fulltext_full)
+    return svar
 
 
 @mcp.tool(
@@ -1292,15 +1264,20 @@ def hamta_eu_mal(malnum: str, sprak: str = "SV") -> MalSvar:
     celex, domstol = _parsera_malnum(malnum_rensat)
     log.info("hamta_eu_mal: malnum=%s → celex=%s domstol=%s", malnum_rensat, celex, domstol)
 
-    # Kontrollera cache
+    try:
+        sprak2, _ = _normalisera_sprak(sprak)
+    except HamtningsFel as exc:
+        raise ToolError(str(exc)) from exc
+
+    # Cachen används bara på det begärda språket, som i hamta_eu_akt.
     cachad = db.hamta_cachad_akt(celex)
-    if cachad and cachad.get("fulltext_md"):
+    if cachad and cachad.get("fulltext_md") and _samma_sprak(cachad.get("sprak"), sprak2):
         fulltext_full = cachad["fulltext_md"]
         return {
             "malnum":    malnum_rensat,
             "celex":     celex,
             "domstol":   domstol,
-            "sprak":     cachad["sprak"],
+            "sprak":     sprak2,
             "titel":     cachad["titel"],
             "datum":     cachad["datum"],
             "fran_cache": True,
@@ -1312,7 +1289,7 @@ def hamta_eu_mal(malnum: str, sprak: str = "SV") -> MalSvar:
     # äldre mål saknar ofta svensk version.
     try:
         raw, anvant_format, anvant_sprak = _hamta_text_med_sprakordning(
-            celex, [sprak, "FR", "EN"],
+            celex, [sprak2, "FR", "EN"],
         )
     except HamtningsFel as exc:
         raise ToolError(f"Avgörande {malnum_rensat} (CELEX {celex}): {exc}") from exc

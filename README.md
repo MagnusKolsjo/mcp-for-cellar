@@ -86,6 +86,6 @@ Lägg till i `claude_desktop_config.json`:
 
 ## Arkitektur
 
-Servern hämtar dokument on-demand från CELLAR och cachar dem i PostgreSQL (`cellar_eu`-schemat). Sökning sker mot den lokala cachen via PostgreSQL FTS (`plainto_tsquery`) och pgvector IVFFlat (semantisk cosine-sökning med KBLabs svenska BERT-modell). Embeddings skapas vid inläggning i cachen.
+Servern hämtar dokument on-demand från CELLAR och cachar dem i PostgreSQL (`cellar_eu`-schemat). Sökning sker mot den lokala cachen via PostgreSQL FTS (`plainto_tsquery`) och pgvector IVFFlat (semantisk cosine-sökning med KBLabs svenska BERT-modell). Embeddings skapas vid inläggning i cachen. Cachen håller en språkversion per akt, den senast hämtade; begärs ett annat språk hämtas akten på nytt.
 
 SPARQL-sökning mot `publications.europa.eu/webapi/rdf/sparql` används för metadata-discovery utan att kräva lokal cache.

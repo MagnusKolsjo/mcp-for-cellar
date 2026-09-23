@@ -32,6 +32,11 @@
   riksdagens öppna data misslyckas.
 
 ### Rättat
+- Cachen och direkthämtningen svarar likadant: `artikel` som inte finns ger
+  felsvar även från cachen (i stället för hela akten), och artikelrubriker
+  på engelska och franska (`Article N`) känns igen. Cachen används bara när
+  akten ligger där på det begärda språket; annars hämtas den på nytt.
+  Cachen håller fortfarande en språkversion per akt, den senast hämtade.
 - Ett dokument i flera delar (DOC_1, DOC_2 ...) där en del inte kunde hämtas
   returnerades tyst utan den delen. Tillfälliga fel prövas nu en gång till;
   saknas en del ändå ges ett felsvar som namnger den, i stället för en
