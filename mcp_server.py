@@ -24,6 +24,7 @@ import os
 import re
 import logging
 import threading
+import time
 from pathlib import Path
 from typing import Optional
 from urllib.parse import quote
@@ -526,14 +527,59 @@ def _cellar_get(url: str, **kwargs) -> requests.Response:
         ) from exc
 
 
-def _hamta_delar(urls: list[str]) -> list[bytes]:
-    """Hämtar en manifestations dokument (DOC_n) och returnerar de som har innehåll."""
-    innehall: list[bytes] = []
-    for url in urls[:_MAX_DELAR]:
-        log.info("Hämtar %s", url)
-        r = _cellar_get(url)
+def _hamta_del(url: str) -> Optional[bytes]:
+    """Hämtar ett dokument (DOC_n). Returnerar None om CELLAR saknar det (404).
+
+    Tillfälliga fel (429, 5xx, nätverksfel) prövas en gång till efter en
+    kort paus; kvarstår felet kastas KallaSvararInte.
+    """
+    for forsok in range(2):
+        try:
+            r = _cellar_get(url)
+        except KallaSvararInte:
+            if forsok == 0:
+                time.sleep(2)
+                continue
+            raise
         if r.status_code == 200 and r.content:
-            innehall.append(r.content)
+            return r.content
+        if r.status_code == 404:
+            return None
+        if forsok == 0 and (r.status_code == 429 or r.status_code >= 500):
+            log.info("CELLAR svarade HTTP %d för %s — försöker igen", r.status_code, url)
+            time.sleep(2)
+            continue
+        raise KallaSvararInte(
+            f"CELLAR svarade HTTP {r.status_code} för {url.rsplit('/', 1)[-1]}. "
+            "Försök igen om en stund."
+        )
+    raise KallaSvararInte("CELLAR svarade inte. Försök igen om en stund.")
+
+
+def _hamta_delar(urls: list[str]) -> list[bytes]:
+    """Hämtar alla dokument i en manifestation, eller inget.
+
+    En rättsakt vars mittersta del saknas ser komplett ut för läsaren och
+    skulle dessutom sparas så i cachen. Därför returneras antingen alla
+    delar eller, när ingen del finns, en tom lista (formatet saknas). Finns
+    vissa delar men inte andra kastas KallaSvararInte med de saknade delarna.
+    """
+    urls = urls[:_MAX_DELAR]
+    innehall: list[bytes] = []
+    saknade: list[str] = []
+    for url in urls:
+        log.info("Hämtar %s", url)
+        del_ = _hamta_del(url)
+        if del_ is None:
+            saknade.append(url.rsplit("/", 1)[-1])
+        else:
+            innehall.append(del_)
+    if innehall and saknade:
+        raise KallaSvararInte(
+            f"CELLAR levererade bara {len(innehall)} av {len(urls)} delar av "
+            f"dokumentet (saknas: {', '.join(saknade)}). Texten returneras inte "
+            "ofullständig. Försök igen om en stund."
+        )
     return innehall
 
 

@@ -32,6 +32,10 @@
   riksdagens öppna data misslyckas.
 
 ### Rättat
+- Ett dokument i flera delar (DOC_1, DOC_2 ...) där en del inte kunde hämtas
+  returnerades tyst utan den delen. Tillfälliga fel prövas nu en gång till;
+  saknas en del ändå ges ett felsvar som namnger den, i stället för en
+  ofullständig text som ser komplett ut och sparas i cachen.
 - http-läget startade inte (anropade `mcp.get_asgi_app()`, som inte finns).
 - Texthämtningen gav 404 för bl.a. 32016R0679 och 32024R1689 trots att
   CELLAR har texten.
