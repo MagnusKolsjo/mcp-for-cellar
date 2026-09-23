@@ -15,7 +15,7 @@ Datakällor:
   EUR-Lex används bara när CELLAR saknar texten och EUR-Lex svarar med
   innehåll; dess botskydd respekteras.
 
-Transport styrs via MCP_TRANSPORT i .env: stdio (standard) eller http.
+Transport styrs via MCP_TRANSPORT i .env: stdio eller http (se mcp_transport.py).
 """
 
 from __future__ import annotations
@@ -23,29 +23,31 @@ from __future__ import annotations
 import os
 import re
 import logging
+import threading
 from pathlib import Path
 from typing import Optional
 from urllib.parse import quote
+
+# typing_extensions.TypedDict krävs av pydantic före Python 3.12.
+from typing_extensions import NotRequired, TypedDict
 
 from dotenv import load_dotenv
 load_dotenv()          # MÅSTE köras innan "import db" — db.DATABASE_URL läses vid importtid
 
 import requests
 from bs4 import BeautifulSoup
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 
 import db
+from mcp_annotationer import CACHE_HINTAR, LASNING_DB, LASNING_EXTERN
+from mcp_transport import starta
 
 # ---------------------------------------------------------------------------
 # Konfiguration
 # ---------------------------------------------------------------------------
 
 _SCRIPT_DIR = Path(__file__).parent.resolve()
-
-MCP_TRANSPORT = os.getenv("MCP_TRANSPORT", "stdio")
-MCP_HOST      = os.getenv("MCP_HOST", "127.0.0.1")
-MCP_PORT      = int(os.getenv("MCP_PORT", "8010"))
-MCP_API_KEY   = os.getenv("MCP_API_KEY", "")
 
 SPARQL_ENDPOINT = os.getenv(
     "CELLAR_SPARQL_ENDPOINT",
@@ -153,14 +155,33 @@ def expandera_fraga(query: str) -> list[str]:
 # ---------------------------------------------------------------------------
 
 _modell = None
+_modell_las = threading.Lock()
+
 
 def _hamta_modell():
+    """Laddar embeddingmodellen första gången den behövs.
+
+    Verktygen körs på arbetstrådar. Dubbelkontrollerad låsning hindrar att
+    två samtidiga anrop laddar modellen var för sig, utan att senare anrop
+    behöver ta låset.
+    """
     global _modell
     if _modell is None:
-        from sentence_transformers import SentenceTransformer
-        log.info("Laddar embeddingmodell: %s", EMBEDDING_MODEL)
-        _modell = SentenceTransformer(EMBEDDING_MODEL)
+        with _modell_las:
+            if _modell is None:
+                from sentence_transformers import SentenceTransformer
+                log.info("Laddar embeddingmodell: %s", EMBEDDING_MODEL)
+                _modell = SentenceTransformer(EMBEDDING_MODEL)
     return _modell
+
+
+def _forvarm_modell() -> None:
+    """Laddar modellen före första anropet i http-läget, om den används.
+
+    Embeddings lagras och söks bara i PostgreSQL; med SQLite behövs modellen inte.
+    """
+    if db.DATABASE_URL and db._ar_postgres():
+        _hamta_modell()
 
 # ---------------------------------------------------------------------------
 # Konstanter: typ-URI:er verifierade mot live CELLAR
@@ -943,14 +964,19 @@ def _indexera_akt(celex: str, sprak: str, fulltext: str,
     returnering till MCP-anroparen, inte vid lagring.
     """
     db.spara_akt(celex, sprak, titel, datum, eli, typ, fulltext)
+    chunks = _chunka_text(fulltext)
+    if not chunks or not db.DATABASE_URL:
+        return
+    if not db._ar_postgres():
+        # SQLite lagrar bara chunktexten; att räkna embeddings vore bortkastat.
+        db.spara_chunks(celex, chunks, [])
+        return
     try:
         modell = _hamta_modell()
-        chunks = _chunka_text(fulltext)
-        if chunks:
-            embeddings = modell.encode(
-                chunks, batch_size=8, convert_to_numpy=True,
-            ).tolist()
-            db.spara_chunks(celex, chunks, embeddings)
+        embeddings = modell.encode(
+            chunks, batch_size=8, convert_to_numpy=True,
+        ).tolist()
+        db.spara_chunks(celex, chunks, embeddings)
     except Exception as exc:
         log.warning("Embedding misslyckades för %s: %s", celex, exc)
 
@@ -997,8 +1023,108 @@ def _sok_riksdag_propositioner(sok_term: str, max_antal: int = 5) -> list[dict]:
 # MCP-servern
 # ---------------------------------------------------------------------------
 
-mcp = FastMCP(
+# ---------------------------------------------------------------------------
+# Svarstyper
+#
+# Fält som kan saknas i CELLAR:s metadata (titel, datum, ELI) eller i äldre
+# cacherader är typade som X | None, eftersom ett None i ett strikt typat
+# fält får hela anropet att misslyckas.
+# ---------------------------------------------------------------------------
+
+class AktSvar(TypedDict):
+    celex: str
+    sprak: str
+    format: NotRequired[str]
+    titel: str | None
+    datum: str | None
+    eli: str | None
+    fran_cache: bool
+    artikel: NotRequired[int]
+    tecken: NotRequired[int]
+    fulltext: str
+
+
+class MalSvar(TypedDict):
+    malnum: str
+    celex: str
+    domstol: str
+    sprak: str
+    format: NotRequired[str]
+    titel: str | None
+    datum: str | None
+    eli: NotRequired[str | None]
+    fran_cache: bool
+    tecken: int
+    fulltext: str
+
+
+class CacheTraff(TypedDict):
+    celex: str
+    titel: str | None
+    datum: str | None
+    typ: str | None
+    eli: str | None
+    rang: NotRequired[float | None]
+    likhet: NotRequired[float | None]
+    utdrag: str | None
+
+
+class CacheSokSvar(TypedDict):
+    fraga: str
+    antal: int
+    treffar: list[CacheTraff]
+
+
+class MetadataTraff(TypedDict):
+    celex: str | None
+    titel: str | None
+    datum: str | None
+    eli: str | None
+
+
+class MetadataSvar(TypedDict):
+    antal: int
+    sokterm: str | None
+    typ: str | None
+    ar_fran: int | None
+    ar_till: int | None
+    expansion: list[str] | None
+    treffar: list[MetadataTraff]
+    tips: str
+
+
+class Genomforande(TypedDict):
+    celex: str
+    datum: str | None
+    titel: str | None
+    medlemsstat: str
+    kalla: str
+
+
+class RiksdagProposition(TypedDict):
+    beteckning: str | None
+    rubrik: str | None
+    datum: str | None
+    url: str
+    kalla: str
+
+
+# Fältet "not" är ett reserverat ord i Python och kräver funktionsformen.
+GenomforandeSvar = TypedDict("GenomforandeSvar", {
+    "celex": str,
+    "eu_nummer": "str | None",
+    "filtrar_pa_stat": "str | None",
+    "cellar_genomforanden": list[Genomforande],
+    "riksdag_propositioner": list[RiksdagProposition],
+    "riksdag_fel": NotRequired[str],
+    "not": str,
+})
+
+
+mcp = MCPServer(
     "cellar-eu-ratt",
+    version=VERSION,
+    cache_hints=CACHE_HINTAR,
     instructions=(
         "MCP-server för EU-rätt via CELLAR. Verktyg: hamta_eu_akt (rättsakter via CELEX), "
         "hamta_eu_mal (domar C-xxx/T-xxx), sok_i_cachade_akter (FTS/semantisk sökning), "
@@ -1010,6 +1136,8 @@ mcp = FastMCP(
 
 @mcp.tool(
     name="hamta_eu_akt",
+    title="Hämta EU-rättsakt",
+    annotations=LASNING_EXTERN,
     description=(
         "Hämtar fulltext för en EU-rättsakt via CELEX-nummer. Cachar lokalt i databasen "
         "för framtida sökning. Giltiga CELEX-format: 32006L0054 (direktiv), "
@@ -1021,7 +1149,7 @@ mcp = FastMCP(
     ),
 )
 def hamta_eu_akt(celex: str, sprak: str = "SV",
-                 artikel: Optional[int] = None) -> dict:
+                 artikel: Optional[int] = None) -> AktSvar:
     """Hämtar och cachar en EU-rättsakt.
 
     Args:
@@ -1074,7 +1202,7 @@ def hamta_eu_akt(celex: str, sprak: str = "SV",
             celex, [sprak, "EN"],
         )
     except HamtningsFel as exc:
-        return {"fel": str(exc)}
+        raise ToolError(str(exc)) from exc
 
     meta = _hamta_sparql_metadata(celex) or {}
 
@@ -1124,12 +1252,10 @@ def hamta_eu_akt(celex: str, sprak: str = "SV",
                 "artikel":    artikel,
                 "fulltext":   art_match.group(1).strip(),
             }
-        return {
-            "fel": (
-                f"Artikel {artikel} hittades inte i {celex}. "
-                "Kontrollera att artikelnumret stämmer."
-            )
-        }
+        raise ToolError(
+            f"Artikel {artikel} hittades inte i {celex}. Kontrollera att "
+            "artikelnumret stämmer, eller hämta hela akten utan parametern artikel."
+        )
 
     return {
         "celex":      celex,
@@ -1146,6 +1272,8 @@ def hamta_eu_akt(celex: str, sprak: str = "SV",
 
 @mcp.tool(
     name="hamta_eu_mal",
+    title="Hämta EU-domstolens avgörande",
+    annotations=LASNING_EXTERN,
     description=(
         "Hämtar fulltext för ett EU-domstolsavgörande. "
         "Accepterar EU-domstolens målnummer (C-441/17, C-30/19 PPU) "
@@ -1154,7 +1282,7 @@ def hamta_eu_akt(celex: str, sprak: str = "SV",
         "fältet sprak i svaret visar vilket språk texten har."
     ),
 )
-def hamta_eu_mal(malnum: str, sprak: str = "SV") -> dict:
+def hamta_eu_mal(malnum: str, sprak: str = "SV") -> MalSvar:
     """Hämtar ett EU-domstolsavgörande.
 
     Args:
@@ -1189,7 +1317,7 @@ def hamta_eu_mal(malnum: str, sprak: str = "SV") -> dict:
             celex, [sprak, "FR", "EN"],
         )
     except HamtningsFel as exc:
-        return {"fel": f"Avgörande {malnum_rensat} (CELEX {celex}): {exc}"}
+        raise ToolError(f"Avgörande {malnum_rensat} (CELEX {celex}): {exc}") from exc
 
     meta = _hamta_sparql_metadata(celex) or {}
 
@@ -1216,6 +1344,8 @@ def hamta_eu_mal(malnum: str, sprak: str = "SV") -> dict:
 
 @mcp.tool(
     name="sok_i_cachade_akter",
+    title="Sök bland cachade EU-akter",
+    annotations=LASNING_DB,
     description=(
         "Söker i fulltext bland lokalt cachade EU-rättsakter. "
         "PostgreSQL: FTS och semantisk sökning (pgvector). SQLite: LIKE-sökning. "
@@ -1231,7 +1361,7 @@ def sok_i_cachade_akter(
     ar_fran: Optional[int] = None,
     ar_till: Optional[int] = None,
     max_antal: int = 10,
-) -> dict:
+) -> CacheSokSvar:
     """Söker i cachade EU-rättsakter.
 
     Args:
@@ -1244,10 +1374,9 @@ def sok_i_cachade_akter(
     max_antal = min(int(max_antal), 20)
 
     if typ and typ.lower() not in TYP_URIS:
-        return {
-            "fel": f"Okänd typ: {typ!r}",
-            "tillgangliga_typer": list(TYP_BESKRIVING.keys()),
-        }
+        raise ToolError(
+            f"Okänd typ: {typ!r}. Tillgängliga typer: {', '.join(TYP_BESKRIVING)}."
+        )
 
     typ_kod = None
     if typ:
@@ -1293,6 +1422,8 @@ _SOK_TIDSGRANS_TIPS = (
 
 @mcp.tool(
     name="sok_eu_metadata",
+    title="Sök EU-rättsakter i CELLAR",
+    annotations=LASNING_EXTERN,
     description=(
         "Söker EU-rättsakter via SPARQL mot CELLAR — hittar akter utan att cacha dem lokalt. "
         "Returnerar lista med CELEX-nummer, titlar och datum att använda med hamta_eu_akt. "
@@ -1314,7 +1445,7 @@ def sok_eu_metadata(
     ar_till: Optional[int] = None,
     sprak: str = "SV",
     max_antal: int = 20,
-) -> dict:
+) -> MetadataSvar:
     """Söker EU-rättsakter via SPARQL (metadatasökning, ingen cachning).
 
     Args:
@@ -1329,10 +1460,9 @@ def sok_eu_metadata(
     max_antal = min(int(max_antal), 50)
 
     if typ and typ.lower() not in TYP_URIS:
-        return {
-            "fel": f"Okänd typ: {typ!r}",
-            "tillgangliga_typer": list(TYP_BESKRIVING.items()),
-        }
+        raise ToolError(
+            f"Okänd typ: {typ!r}. Tillgängliga typer: {', '.join(TYP_BESKRIVING)}."
+        )
 
     # Query-expansion: flerspråkiga ekvivalenter via valfritt LLM-anrop
     extra_termer = expandera_fraga(sokterm) if sokterm else []
@@ -1391,7 +1521,7 @@ LIMIT {max_antal}"""
     try:
         rader = _kora_sparql(sparql_query)
     except HamtningsFel as exc:
-        return {"fel": f"{exc} {_SOK_TIDSGRANS_TIPS}"}
+        raise ToolError(f"{exc} {_SOK_TIDSGRANS_TIPS}") from exc
 
     return {
         "antal":       len(rader),
@@ -1414,6 +1544,8 @@ LIMIT {max_antal}"""
 
 @mcp.tool(
     name="hitta_nationellt_genomforande",
+    title="Hitta nationellt genomförande",
+    annotations=LASNING_EXTERN,
     description=(
         "Hittar nationella genomförandeåtgärder för ett EU-direktiv. "
         "Söker i CELLAR (typ MEAS_NATION_IMPL) för alla officiellt anmälda genomförandelagar. "
@@ -1426,7 +1558,7 @@ LIMIT {max_antal}"""
 def hitta_nationellt_genomforande(
     celex: str,
     medlemsstat: Optional[str] = None,
-) -> dict:
+) -> GenomforandeSvar:
     """Hittar nationella genomförandeåtgärder för ett EU-direktiv.
 
     Args:
@@ -1474,25 +1606,31 @@ WHERE {{
 ORDER BY ?stat ?datum
 LIMIT 100"""
 
-    cellar_treffar: list[dict] = []
+    # CELLAR är huvudkällan här. En tom lista efter ett misslyckat anrop
+    # skulle se ut som "inga genomföranden", så felet förs vidare.
+    cellar_treffar: list[Genomforande] = []
     try:
         rader = _kora_sparql(query)
-        for r in rader:
-            if r.get("genomf_celex"):
-                stat_kod_resultat = (r.get("stat") or "").split("/")[-1]
-                cellar_treffar.append({
-                    "celex":      r["genomf_celex"],
-                    "datum":      r.get("datum"),
-                    "titel":      r.get("titel"),
-                    "medlemsstat": stat_kod_resultat,
-                    "kalla":      "CELLAR",
-                })
     except HamtningsFel as exc:
-        log.warning("SPARQL misslyckades för genomförande av %s: %s", celex, exc)
+        raise ToolError(
+            f"Genomförandeåtgärderna för {celex} kunde inte hämtas: {exc} "
+            "Försök igen om en stund."
+        ) from exc
+    for r in rader:
+        if r.get("genomf_celex"):
+            stat_kod_resultat = (r.get("stat") or "").split("/")[-1]
+            cellar_treffar.append({
+                "celex":      r["genomf_celex"],
+                "datum":      r.get("datum"),
+                "titel":      r.get("titel"),
+                "medlemsstat": stat_kod_resultat,
+                "kalla":      "CELLAR",
+            })
 
     # Riksdag-sökning som komplement för Sverige.
     # Normalisera eventuell 2-bokstavs-kod så att "SE" också matchar.
-    riksdag_treffar: list[dict] = []
+    riksdag_treffar: list[RiksdagProposition] = []
+    riksdag_fel: Optional[str] = None
     normaliserad_stat = (
         _NORMALISERA_LAND.get(medlemsstat.strip().upper(), medlemsstat.strip().upper())
         if medlemsstat else None
@@ -1503,10 +1641,14 @@ LIMIT 100"""
         if eu_nummer:
             try:
                 riksdag_treffar = _sok_riksdag_propositioner(eu_nummer)
-            except requests.RequestException as exc:
+            except (requests.RequestException, ValueError) as exc:
                 log.warning("Riksdag-sökning misslyckades: %s", exc)
+                riksdag_fel = (
+                    "Sökningen i riksdagens öppna data misslyckades "
+                    f"({type(exc).__name__}); riksdag_propositioner är därför tom."
+                )
 
-    return {
+    svar: GenomforandeSvar = {
         "celex":            celex,
         "eu_nummer":        _parsera_celex_till_eu_nummer(celex),
         "filtrar_pa_stat":  medlemsstat,
@@ -1518,6 +1660,9 @@ LIMIT 100"""
             "och kan täcka fall som inte anmälts till CELLAR."
         ),
     }
+    if riksdag_fel:
+        svar["riksdag_fel"] = riksdag_fel
+    return svar
 
 
 # ---------------------------------------------------------------------------
@@ -1526,35 +1671,11 @@ LIMIT 100"""
 
 if __name__ == "__main__":
     _konfigurera_logging()
-    db.initiera_schema()
-
-    if MCP_TRANSPORT == "http":
-        import uvicorn
-        from starlette.applications import Starlette
-        from starlette.middleware.base import BaseHTTPMiddleware
-        from starlette.responses import Response
-
-        class BearerTokenMiddleware(BaseHTTPMiddleware):
-            async def dispatch(self, request, call_next):
-                if MCP_API_KEY:
-                    auth = request.headers.get("Authorization", "")
-                    if auth != f"Bearer {MCP_API_KEY}":
-                        return Response("Obehörig", status_code=401)
-                return await call_next(request)
-
-        # Förladda embeddingmodell i HTTP-läge
-        _hamta_modell()
-
-        # OBS: db.py använder per-anrops-anslutningar som är korrekta för
-        # stdio-transport. Vid HTTP-deployment med flera samtidiga klienter
-        # bör psycopg2.pool.ThreadedConnectionPool läggas till i db.py
-        # för att undvika att varje anrop öppnar en ny PG-anslutning.
-        app = Starlette()
-        app.add_middleware(BearerTokenMiddleware)
-        app.mount("/", mcp.get_asgi_app())
-
-        log.info("Startar HTTP-server på %s:%s", MCP_HOST, MCP_PORT)
-        uvicorn.run(app, host=MCP_HOST, port=MCP_PORT)
-    else:
-        log.info("Startar i stdio-läge")
-        mcp.run()
+    # db.py öppnar en anslutning per anrop, vilket är trådsäkert även när
+    # http-läget kör flera verktygsanrop samtidigt.
+    starta(
+        mcp,
+        standardport=8010,
+        initiera=db.initiera_schema,
+        forvarm_http=_forvarm_modell,
+    )
