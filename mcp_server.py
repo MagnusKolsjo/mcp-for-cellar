@@ -905,7 +905,7 @@ def _parsera_celex_till_eu_nummer(celex: str) -> Optional[str]:
 def _hamta_sparql_metadata(celex: str) -> Optional[dict]:
     """Hämtar titel, datum och ELI för ett CELEX via SPARQL."""
     query = f"""PREFIX cdm: <http://publications.europa.eu/ontology/cdm#>
-SELECT ?titel ?datum ?eli ?typ
+SELECT ?titel ?datum ?eli ?typ_uri
 WHERE {{
   {_celex_monster("work", celex)}
   ?work cdm:work_date_document ?datum ;
@@ -927,7 +927,7 @@ WHERE {{
                 "titel": r.get("titel"),
                 "datum": r.get("datum"),
                 "eli":   r.get("eli"),
-                "typ":   typ_kod,
+                "typ":   typ_kod or None,
             }
     except HamtningsFel as exc:
         log.warning("Kunde inte hämta SPARQL-metadata för %s: %s", celex, exc)
@@ -1194,8 +1194,11 @@ def hamta_eu_mal(malnum: str, sprak: str = "SV") -> dict:
     meta = _hamta_sparql_metadata(celex) or {}
 
     fulltext_full = _rensa_html(raw) if anvant_format in ("xhtml", "html") else raw
+    # Typkoden ur CELLAR (JUDG, ORDER, OPIN_AG ...) är den som typfiltret i
+    # sok_i_cachade_akter jämför mot.
     _indexera_akt(celex, anvant_sprak, fulltext_full,
-                  meta.get("titel"), meta.get("datum"), meta.get("eli"), "dom")
+                  meta.get("titel"), meta.get("datum"), meta.get("eli"),
+                  meta.get("typ") or None)
 
     return {
         "malnum":     malnum_rensat,
