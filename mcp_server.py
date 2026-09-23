@@ -10,7 +10,10 @@ Fem verktyg:
 
 Datakällor:
   SPARQL: http://publications.europa.eu/webapi/rdf/sparql
-  REST:   https://publications.europa.eu/resource/celex/{CELEX}
+  Text:   http://publications.europa.eu/resource/celex/{CELEX}
+          (innehållsförhandling med Accept och Accept-Language)
+  EUR-Lex används bara när CELLAR saknar texten och EUR-Lex svarar med
+  innehåll; dess botskydd respekteras.
 
 Transport styrs via MCP_TRANSPORT i .env: stdio (standard) eller http.
 """
@@ -22,6 +25,7 @@ import re
 import logging
 from pathlib import Path
 from typing import Optional
+from urllib.parse import quote
 
 from dotenv import load_dotenv
 load_dotenv()          # MÅSTE köras innan "import db" — db.DATABASE_URL läses vid importtid
@@ -50,6 +54,17 @@ SPARQL_ENDPOINT = os.getenv(
 CELLAR_REST_BASE = os.getenv(
     "CELLAR_REST_BASE",
     "http://publications.europa.eu/resource/celex",
+)
+# Senaste släppta version enligt CHANGELOG.md. Rapporteras till klienten
+# och ingår i User-Agent, så att källorna kan se vilken version som anropar.
+VERSION = "1.1.0"
+
+# Projektets egen User-Agent. Den ska aldrig se ut som en webbläsare:
+# källornas botskydd är till för att skilja maskiner från människor, och en
+# ärlig identifiering med kontaktväg är det källorna kan agera på.
+CELLAR_USER_AGENT = os.getenv(
+    "CELLAR_USER_AGENT",
+    f"mcp-for-cellar/{VERSION} (+https://github.com/MagnusKolsjo/mcp-for-cellar)",
 )
 SPARQL_TIMEOUT = int(os.getenv("SPARQL_TIMEOUT", "60"))
 REST_TIMEOUT   = int(os.getenv("REST_TIMEOUT", "30"))
@@ -212,23 +227,29 @@ SPRAK_URIS: dict[str, str] = {
     "FR": "http://publications.europa.eu/resource/authority/language/FRA",
 }
 
-CELLAR_FORMAT_ORDNING    = ["xhtml", "html", "pdf"]
+# EU:s 24 officiella språk. Verktygen och EUR-Lex använder tvåbokstavskoder
+# (ISO 639-1); CELLAR använder trebokstavskoder (ISO 639-2/T) både i
+# språk-URI:erna och i Accept-Language vid innehållsförhandling.
+_SPRAK_3: dict[str, str] = {
+    "BG": "BUL", "CS": "CES", "DA": "DAN", "DE": "DEU", "EL": "ELL",
+    "EN": "ENG", "ES": "SPA", "ET": "EST", "FI": "FIN", "FR": "FRA",
+    "GA": "GLE", "HR": "HRV", "HU": "HUN", "IT": "ITA", "LT": "LIT",
+    "LV": "LAV", "MT": "MLT", "NL": "NLD", "PL": "POL", "PT": "POR",
+    "RO": "RON", "SK": "SLK", "SL": "SLV", "SV": "SWE",
+}
+_SPRAK_2: dict[str, str] = {tre: tva for tva, tre in _SPRAK_3.items()}
+
 EURLEX_CONTENT_BASE      = "https://eur-lex.europa.eu/legal-content"
 EURLEX_LEXURISERV_BASE   = "https://eur-lex.europa.eu/LexUriServ/LexUriServ.do"
 
-# SPARQL-discovery: CDM representation-type URI-suffix → format-kod
-# PDF/A-varianter mappas till "pdf" — pdfplumber hanterar dem.
-# DOC och FMX4 skippas — kräver specialbibliotek och ger sällan bättre täckning.
-_CDM_FORMAT_MAP: dict[str, str] = {
-    "XHTML":  "xhtml",
-    "HTML":   "html",
-    "PDF":    "pdf",
-    "PDFA1A": "pdf",
-    "PDFA1B": "pdf",
-    "PDFA2A": "pdf",
-    "PDFA2B": "pdf",
-    "PDFA3A": "pdf",
-    "PDFA3B": "pdf",
+# Format som går att göra text av, i den ordning de provas. XHTML bär
+# ELI-strukturen (id="art_N") och ger de säkraste artikelutdragen. PDF
+# kräver textextraktion och tappar strukturen. Formex (fmx4) och DOC tas
+# inte med: de kräver egna tolkar och finns i praktiken bara där XHTML
+# eller PDF också finns.
+_ACCEPT_TYP: dict[str, str] = {
+    "xhtml": "application/xhtml+xml",
+    "html":  "text/html",
 }
 
 STAT_URIS: dict[str, str] = {
@@ -304,17 +325,76 @@ _CELEX_SEKUNDAR = re.compile(r'^3(\d{4})([LRD])0*(\d+)$', re.IGNORECASE)
 # Hjälpfunktioner
 # ---------------------------------------------------------------------------
 
+# En session för alla anrop mot CELLAR, SPARQL-tjänsten, EUR-Lex och
+# riksdagen: återanvända anslutningar och projektets egen User-Agent.
+# Headers sätts bara här, vid modulinläsning, så att sessionen kan delas
+# mellan verktygsanrop som körs på olika trådar.
+_HTTP = requests.Session()
+_HTTP.headers["User-Agent"] = CELLAR_USER_AGENT
+
+# En manifestation kan bestå av flera dokument (DOC_1, DOC_2, ...). Taket
+# skyddar mot en felaktig lista i ett 300-svar; ingen känd akt har fler.
+_MAX_DELAR = 50
+
+
+class HamtningsFel(Exception):
+    """Förväntat fel vid hämtning från CELLAR eller EUR-Lex.
+
+    Meddelandet är skrivet för den som anropar verktyget och förs vidare
+    oförändrat till verktygets felsvar.
+    """
+
+
+class CelexOkant(HamtningsFel):
+    """CELLAR känner inte till CELEX-numret."""
+
+
+class KallaSvararInte(HamtningsFel):
+    """CELLAR eller SPARQL-tjänsten svarade inte, eller svarade med serverfel."""
+
+
+class _TextSaknas(Exception):
+    """Ingen text gick att hämta på ett visst språk. Bär försöksloggen."""
+
+    def __init__(self, forsok: list[str]):
+        super().__init__("; ".join(forsok))
+        self.forsok = forsok
+
+
 def _kora_sparql(query: str) -> list[dict]:
-    """Kör en SPARQL-fråga mot CELLAR och returnerar rader som ordböcker."""
+    """Kör en SPARQL-fråga mot CELLAR och returnerar rader som ordböcker.
+
+    Kastar KallaSvararInte vid timeout, nätverksfel, HTTP-fel eller svar
+    som inte är JSON. Anslutningen får tio sekunder; själva frågan får
+    SPARQL_TIMEOUT, eftersom tunga titelsökningar tar tid hos tjänsten.
+    """
     log.info("Kör SPARQL (%d tecken)", len(query))
-    svar = requests.post(
-        SPARQL_ENDPOINT,
-        data={"query": query},
-        headers={"Accept": "application/sparql-results+json"},
-        timeout=SPARQL_TIMEOUT,
-    )
-    svar.raise_for_status()
-    data = svar.json()
+    try:
+        svar = _HTTP.post(
+            SPARQL_ENDPOINT,
+            data={"query": query},
+            headers={"Accept": "application/sparql-results+json"},
+            timeout=(10, SPARQL_TIMEOUT),
+        )
+        svar.raise_for_status()
+    except requests.Timeout as exc:
+        raise KallaSvararInte(
+            f"CELLAR:s SPARQL-tjänst svarade inte inom {SPARQL_TIMEOUT} sekunder."
+        ) from exc
+    except requests.HTTPError as exc:
+        raise KallaSvararInte(
+            f"CELLAR:s SPARQL-tjänst svarade med HTTP {exc.response.status_code}."
+        ) from exc
+    except requests.RequestException as exc:
+        raise KallaSvararInte(
+            f"Kunde inte nå CELLAR:s SPARQL-tjänst ({type(exc).__name__})."
+        ) from exc
+    try:
+        data = svar.json()
+    except ValueError as exc:
+        raise KallaSvararInte(
+            "CELLAR:s SPARQL-tjänst gav ett svar som inte gick att tolka."
+        ) from exc
     variabler = data.get("head", {}).get("vars", [])
     rader = []
     for bindning in data.get("results", {}).get("bindings", []):
@@ -336,224 +416,353 @@ def _sparql_escape(s: str) -> str:
     return s.replace("\\", "\\\\").replace('"', '\\"')
 
 
-def _sok_cellar_manifestationer(celex: str, sprak: str) -> list[str]:
-    """Frågar CELLAR via SPARQL om vilka manifestationstyper som finns.
+def _celex_monster(variabel: str, celex: str) -> str:
+    """SPARQL-mönster som binder ?variabel till verket med ett visst CELEX-nummer.
 
-    Returnerar en prioriterad lista med format-koder (t.ex. ['pdf']) i ordning
-    xhtml > html > pdf. Tom lista = okänt eller SPARQL-fel — fallback till
-    CELLAR_FORMAT_ORDNING-blind probing.
-
-    Exempel: 32014R1143 (SV) → ['pdf'] om bara PDF-manifestation finns i CELLAR.
+    CELLAR lagrar CELEX-numret som xsd:string. Ett VALUES-block med den
+    typade och den otypade literalen slår direkt i tjänstens index, medan
+    FILTER(STR(?x) = "...") får tjänsten att gå igenom alla CELEX-nummer
+    och tar tiotals sekunder per fråga.
     """
-    _lang_map = {"SV": "SWE", "EN": "ENG", "DE": "DEU", "FR": "FRA",
-                 "DA": "DAN", "FI": "FIN", "NL": "NLD", "PL": "POL",
-                 "ES": "SPA", "IT": "ITA", "PT": "POR", "CS": "CES",
-                 "HU": "HUN", "RO": "RON", "SK": "SLK", "SL": "SLV"}
-    lang = _lang_map.get(sprak.upper(), sprak.upper())
-    sprak_uri = f"http://publications.europa.eu/resource/authority/language/{lang}"
+    c = _sparql_escape(celex)
+    return (
+        f'VALUES ?{variabel}_celex {{ "{c}"^^<http://www.w3.org/2001/XMLSchema#string> "{c}" }}\n'
+        f"  ?{variabel} cdm:resource_legal_id_celex ?{variabel}_celex ."
+    )
 
+
+def _normalisera_sprak(sprak: str) -> tuple[str, str]:
+    """Returnerar (tvåbokstavskod, trebokstavskod) för ett EU-språk.
+
+    Tar emot både 'SV' och 'SWE', i valfri skiftläge. Kastar HamtningsFel
+    för koder som inte är något av EU:s officiella språk.
+    """
+    s = sprak.strip().upper()
+    if s in _SPRAK_3:
+        return s, _SPRAK_3[s]
+    if s in _SPRAK_2:
+        return _SPRAK_2[s], s
+    raise HamtningsFel(
+        f"Okänd språkkod {sprak!r}. Ange en tvåbokstavskod för ett av EU:s "
+        f"officiella språk: {', '.join(sorted(_SPRAK_3))}."
+    )
+
+
+def _lista_manifestationer(celex: str) -> Optional[dict[str, set[str]]]:
+    """Frågar CELLAR vilka språk och format som finns för en akt.
+
+    Returnerar {trebokstavskod: {format, ...}}, t.ex.
+    {"SWE": {"xhtml", "pdfa1a", "fmx4"}}. En tom ordbok betyder att CELLAR
+    inte har några manifestationer för verket. None betyder att frågan
+    misslyckades och att inget är känt om formaten.
+    """
     query = f"""PREFIX cdm: <http://publications.europa.eu/ontology/cdm#>
-SELECT DISTINCT ?manif_type
+SELECT DISTINCT ?sprak ?typ
 WHERE {{
-  ?work cdm:resource_legal_id_celex ?celex_val .
-  FILTER(STR(?celex_val) = "{_sparql_escape(celex)}")
-
+  {_celex_monster("work", celex)}
   ?expr cdm:expression_belongs_to_work ?work ;
-        cdm:expression_uses_language <{sprak_uri}> .
-
+        cdm:expression_uses_language ?sprak .
   ?manif cdm:manifestation_manifests_expression ?expr ;
-         cdm:manifestation_type ?manif_type .
+         cdm:manifestation_type ?typ .
 }}"""
-
     try:
         rader = _kora_sparql(query)
-    except Exception as exc:
-        log.warning("SPARQL-discovery misslyckades för %s (%s): %s", celex, sprak, exc)
-        return []
-
-    format_koder: set[str] = set()
-    for r in rader:
-        typ_uri = r.get("manif_type") or ""
-        typ_kod = typ_uri.split("/")[-1].upper()  # t.ex. "pdf"→"PDF", "xhtml"→"XHTML"
-        fmt = _CDM_FORMAT_MAP.get(typ_kod)
-        if fmt:
-            format_koder.add(fmt)
-
-    if not format_koder:
-        log.info(
-            "SPARQL-discovery: inga kända manifestationer för %s (%s) — "
-            "råa typer: %s",
-            celex, sprak,
-            [r.get("manif_type", "").split("/")[-1] for r in rader] or "[]",
-        )
-        return []
-
-    # Returnera i prioritetsordning: xhtml > html > pdf
-    result = [f for f in CELLAR_FORMAT_ORDNING if f in format_koder]
-    log.info("SPARQL-discovery: %s (%s) → %s", celex, sprak, result)
-    return result
-
-
-def _hamta_cellar_text(celex: str, sprak: str) -> tuple[str, str]:
-    """Hämtar text för en EU-rättsakt via CELLAR REST API med format-fallback.
-
-    Provar formaten i ordning: xhtml → html → pdf (se CELLAR_FORMAT_ORDNING).
-    Returnerar (rå_text, format) där format är 'xhtml', 'html' eller 'pdf'.
-    Kastar ValueError om inget format ger innehåll.
-
-    Protokoll (CELLAR WEMI-modellen):
-      1. GET {CELLAR_REST_BASE}/{CELEX}.{LANG}.{FORMAT}  →  HTTP 303
-         Location: …/cellar/{uuid}.{expr}.{manif}/rdf/object/full
-      2. Hämta RDF för att lista DOC-items, eller fall tillbaka på DOC_1.
-      3. Hämta varje DOC-item och konkatenera innehållet.
-    """
-    lang2 = sprak.upper()                   # 2-bokstavs ISO 639-1 — används för EUR-Lex
-    _lang_map = {"SV": "SWE", "EN": "ENG", "DE": "DEU", "FR": "FRA",
-                 "DA": "DAN", "FI": "FIN", "NL": "NLD", "PL": "POL",
-                 "ES": "SPA", "IT": "ITA", "PT": "POR", "CS": "CES",
-                 "HU": "HUN", "RO": "RON", "SK": "SLK", "SL": "SLV"}
-    lang = _lang_map.get(lang2, lang2)      # 3-bokstavs ISO 639-2/T — används för CELLAR
-
-    sista_fel: Optional[str] = None
-
-    # SPARQL-discovery: ta reda på vilka format som faktiskt finns i CELLAR
-    # för att undvika blinda 404-anrop för varje format.
-    tillgangliga_format = _sok_cellar_manifestationer(celex, sprak)
-    format_att_prova = tillgangliga_format if tillgangliga_format else CELLAR_FORMAT_ORDNING
-    if tillgangliga_format:
-        log.info("SPARQL-discovery styr format-loop: %s", format_att_prova)
-    else:
-        log.info("SPARQL-discovery gav inga träffar — provar standardordning: %s", format_att_prova)
-
-    for fmt in format_att_prova:
-        manifest_url = f"{CELLAR_REST_BASE}/{celex}.{lang}.{fmt}"
-        log.info("Provar CELLAR-format %s: %s", fmt, manifest_url)
-
-        try:
-            r1 = requests.get(manifest_url, timeout=REST_TIMEOUT, allow_redirects=False)
-        except requests.RequestException as exc:
-            sista_fel = str(exc)
-            continue
-
-        if r1.status_code == 404:
-            log.info("Format %s saknas för %s (%s)", fmt, celex, lang)
-            continue
-        if r1.status_code != 303:
-            sista_fel = f"HTTP {r1.status_code} för {fmt}"
-            continue
-
-        location = r1.headers.get("Location", "")
-        if "/rdf/object/full" not in location:
-            sista_fel = f"Oväntat Location-svar: {location}"
-            continue
-
-        manif_bas = location.replace("/rdf/object/full", "")
-
-        # Hämta RDF och lista DOC-items
-        try:
-            rdf_text = requests.get(location, timeout=REST_TIMEOUT).text
-            doc_urls = re.findall(
-                r'rdf:resource="(' + re.escape(manif_bas) + r'/DOC_\d+)"',
-                rdf_text,
-            )
-        except Exception:
-            doc_urls = []
-        if not doc_urls:
-            doc_urls = [manif_bas + "/DOC_1"]
-
-        # Hämta DOC-items
-        innehall: list[bytes] = []
-        for doc_url in doc_urls:
-            log.info("Hämtar %s", doc_url)
-            r = requests.get(doc_url, timeout=REST_TIMEOUT)
-            if r.status_code == 200 and r.content:
-                innehall.append(r.content)
-            elif r.status_code == 404:
-                break
-
-        if not innehall:
-            sista_fel = f"Tomt svar för format {fmt}"
-            continue
-
-        # Konvertera till text beroende på format
-        if fmt in ("xhtml", "html"):
-            return "\n".join(c.decode("utf-8", errors="replace") for c in innehall), fmt
-
-        elif fmt == "pdf":
-            try:
-                import pdfplumber
-                from io import BytesIO
-                delar: list[str] = []
-                for pdf_bytes in innehall:
-                    with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
-                        for sida in pdf.pages:
-                            text = sida.extract_text()
-                            if text:
-                                delar.append(text)
-                if delar:
-                    return "\n".join(delar), "pdf"
-                sista_fel = "PDF utan extraherbar text"
-            except ImportError:
-                log.warning("pdfplumber saknas — PDF-fallback ej tillgänglig")
-                sista_fel = "pdfplumber inte installerat"
-            except Exception as exc:
-                log.warning("PDF-extraktion misslyckades för %s: %s", celex, exc)
-                sista_fel = str(exc)
-
-    # Fallback 4: EUR-Lex direktlänk — täcker originaltexter som saknar CELLAR-manifestation
-    _eurlex_headers = {
-        # EUR-Lex har historiskt krävt Mozilla-prefixad UA — den gamla strängen
-        # `Mozilla/5.0 (compatible; CELLAR-EU-MCP/1.0; ...)` verifierades fungera
-        # 2026-05-18. compatible-syntax behålls med nya repo-namnet så vi följer
-        # projektets UA-konvention så långt EUR-Lex tillåter.
-        "User-Agent": "Mozilla/5.0 (compatible; mcp-for-cellar/1.0; +https://github.com/MagnusKolsjo/mcp-for-cellar)"
-    }
-
-    def _hamta_eurlex_html(url: str) -> Optional[str]:
-        """Hämtar HTML från EUR-Lex. Hanterar 202 med ett omförsök efter 3 s."""
-        import time
-        for forsok in range(2):
-            try:
-                r = requests.get(
-                    url, timeout=REST_TIMEOUT,
-                    allow_redirects=True, headers=_eurlex_headers,
-                )
-                log.info(
-                    "EUR-Lex svarade HTTP %d (%d tecken) för %s (försök %d)",
-                    r.status_code, len(r.text), celex, forsok + 1,
-                )
-                if r.status_code == 200 and r.text.strip():
-                    return r.text
-                if r.status_code == 202 and forsok == 0:
-                    log.info("EUR-Lex 202 — väntar 3 s och försöker igen")
-                    time.sleep(3)
-                    continue
-                break
-            except requests.RequestException as exc:
-                log.warning("EUR-Lex nätverksfel (%s): %s", url, exc)
-                break
+    except HamtningsFel as exc:
+        log.warning("Kunde inte lista manifestationer för %s: %s", celex, exc)
         return None
 
-    # 4a: Huvud-URL (TXT/HTML)
-    eurlex_url = f"{EURLEX_CONTENT_BASE}/{lang2}/TXT/HTML/?uri=CELEX:{celex}"
-    log.info("Provar EUR-Lex huvud-URL: %s", eurlex_url)
-    text = _hamta_eurlex_html(eurlex_url)
+    resultat: dict[str, set[str]] = {}
+    for r in rader:
+        sprak = (r.get("sprak") or "").rsplit("/", 1)[-1].upper()
+        typ = (r.get("typ") or "").rsplit("/", 1)[-1].lower()
+        if sprak and typ:
+            resultat.setdefault(sprak, set()).add(typ)
+    log.info("Manifestationer för %s: %d språk", celex, len(resultat))
+    return resultat
+
+
+class _Manifestlista:
+    """Manifestlistan för en akt, hämtad lat och högst en gång.
+
+    Skapas per verktygsanrop och delas mellan språkförsöken, så att
+    SPARQL-frågan bara körs när innehållsförhandlingen inte räckte.
+    """
+
+    def __init__(self, celex: str):
+        self.celex = celex
+        self._hamtad = False
+        self._varde: Optional[dict[str, set[str]]] = None
+
+    def hamta(self) -> Optional[dict[str, set[str]]]:
+        if not self._hamtad:
+            self._varde = _lista_manifestationer(self.celex)
+            self._hamtad = True
+        return self._varde
+
+
+def _cellar_get(url: str, **kwargs) -> requests.Response:
+    """GET mot CELLAR. Nätverksfel blir KallaSvararInte."""
+    try:
+        return _HTTP.get(url, timeout=REST_TIMEOUT, **kwargs)
+    except requests.RequestException as exc:
+        raise KallaSvararInte(
+            f"CELLAR svarade inte ({type(exc).__name__}). Försök igen om en stund."
+        ) from exc
+
+
+def _hamta_delar(urls: list[str]) -> list[bytes]:
+    """Hämtar en manifestations dokument (DOC_n) och returnerar de som har innehåll."""
+    innehall: list[bytes] = []
+    for url in urls[:_MAX_DELAR]:
+        log.info("Hämtar %s", url)
+        r = _cellar_get(url)
+        if r.status_code == 200 and r.content:
+            innehall.append(r.content)
+    return innehall
+
+
+def _forhandla(celex: str, sprak3: str, accept: str) -> tuple[list[bytes], str]:
+    """Hämtar en akt genom innehållsförhandling mot CELLAR:s CELEX-resurs.
+
+    GET {CELLAR_REST_BASE}/{CELEX} med Accept (format) och Accept-Language
+    (språk) svarar 303 till manifestationens dokument när det finns ett, och
+    300 med en lista när manifestationen består av flera. 404 betyder att
+    formatet eller språket saknas, 400 och 406 att kombinationen inte går
+    att leverera.
+
+    Returnerar (innehåll, notering). Tomt innehåll betyder att inget fanns;
+    noteringen säger varför och används i felmeddelandet. Kastar CelexOkant
+    om CELLAR inte känner till CELEX-numret.
+    """
+    url = f"{CELLAR_REST_BASE}/{quote(celex, safe='()')}"
+    r = _cellar_get(
+        url,
+        headers={"Accept": accept, "Accept-Language": sprak3.lower()},
+        allow_redirects=False,
+    )
+    if r.status_code == 303:
+        location = r.headers.get("Location", "")
+        if not location:
+            return [], "303 utan Location"
+        innehall = _hamta_delar([location])
+        return innehall, "hämtad" if innehall else "tomt dokument"
+    if r.status_code == 300:
+        urls = list(dict.fromkeys(re.findall(r'href="([^"]+/DOC_\d+)"', r.text)))
+        innehall = _hamta_delar(urls)
+        return innehall, f"hämtad ({len(innehall)} delar)" if innehall else "tomma dokument"
+    if r.status_code == 404 and re.search(r"Resource \[system 'celex'.*not found", r.text):
+        raise CelexOkant(
+            f"CELEX-numret {celex} finns inte i CELLAR. Kontrollera numret, "
+            "eller sök fram rätt nummer med sok_eu_metadata."
+        )
+    return [], f"HTTP {r.status_code}"
+
+
+def _hamta_via_rest(celex: str, sprak3: str, fmt: str) -> tuple[list[bytes], str]:
+    """Hämtar en akt via CELLAR:s äldre REST-väg {CELEX}.{SPRÅK}.{format}.
+
+    Vägen svarar 303 till manifestationens RDF, som listar dokumenten. Den
+    fungerar för en del akter men ger 404 för andra, även där manifestationen
+    finns; därför provas den först när innehållsförhandlingen inte räckt.
+    """
+    r1 = _cellar_get(f"{CELLAR_REST_BASE}/{celex}.{sprak3}.{fmt}", allow_redirects=False)
+    if r1.status_code != 303:
+        return [], f"HTTP {r1.status_code}"
+    location = r1.headers.get("Location", "")
+    if "/rdf/object/full" not in location:
+        return [], "oväntad omdirigering"
+    manif_bas = location.replace("/rdf/object/full", "")
+    rdf = _cellar_get(location)
+    doc_urls = re.findall(
+        r'rdf:resource="(' + re.escape(manif_bas) + r'/DOC_\d+)"', rdf.text,
+    ) if rdf.status_code == 200 else []
+    innehall = _hamta_delar(list(dict.fromkeys(doc_urls)) or [manif_bas + "/DOC_1"])
+    return innehall, "hämtad" if innehall else "tomt dokument"
+
+
+def _pdf_till_text(innehall: list[bytes]) -> tuple[Optional[str], str]:
+    """Extraherar text ur PDF-dokument. Returnerar (text eller None, notering)."""
+    try:
+        import pdfplumber
+        from io import BytesIO
+    except ImportError:
+        log.warning("pdfplumber saknas — PDF-texten kan inte extraheras")
+        return None, "pdfplumber är inte installerat"
+    delar: list[str] = []
+    try:
+        for pdf_bytes in innehall:
+            with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
+                for sida in pdf.pages:
+                    text = sida.extract_text()
+                    if text:
+                        delar.append(text)
+    except Exception as exc:
+        log.warning("PDF-extraktion misslyckades: %s", exc)
+        return None, "PDF gick inte att läsa"
+    if not delar:
+        return None, "PDF utan extraherbar text"
+    return "\n".join(delar), "hämtad"
+
+
+def _ar_botskydd(r: requests.Response) -> bool:
+    """Känner igen AWS WAF:s utmaning framför EUR-Lex.
+
+    WAF:en svarar 202 med tom kropp och headern x-amzn-waf-action:
+    challenge när den vill att klienten ska köra JavaScript. Det är en
+    kontroll av webbläsare, inte ett besked om att sidan fortfarande
+    renderas: ett nytt anrop ger samma svar. Servern försöker därför inte
+    igen och försöker inte heller se ut som en webbläsare.
+    """
+    return bool(r.headers.get("x-amzn-waf-action")) or r.status_code == 202
+
+
+def _hamta_eurlex(celex: str, sprak2: str) -> tuple[Optional[str], str]:
+    """Hämtar HTML från EUR-Lex, om EUR-Lex svarar med innehåll.
+
+    Provar TXT/HTML och sedan LexUriServ. Möter första anropet botskyddet
+    görs inget andra, eftersom båda ligger bakom samma WAF.
+    Returnerar (html eller None, notering).
+    """
+    noteringar: list[str] = []
+    for namn, url in (
+        ("TXT/HTML", f"{EURLEX_CONTENT_BASE}/{sprak2}/TXT/HTML/?uri=CELEX:{celex}"),
+        ("LexUriServ", f"{EURLEX_LEXURISERV_BASE}?uri=CELEX:{celex}:{sprak2}:HTML"),
+    ):
+        log.info("Provar EUR-Lex %s: %s", namn, url)
+        try:
+            r = _HTTP.get(url, timeout=REST_TIMEOUT, allow_redirects=True)
+        except requests.RequestException as exc:
+            noteringar.append(f"EUR-Lex {namn}: {type(exc).__name__}")
+            continue
+        log.info("EUR-Lex %s svarade HTTP %d (%d tecken)", namn, r.status_code, len(r.text))
+        if _ar_botskydd(r):
+            noteringar.append(f"EUR-Lex {namn}: blockerat av botskydd (AWS WAF)")
+            break
+        if (
+            r.status_code == 200
+            and r.text.strip()
+            and "The requested document does not exist" not in r.text
+        ):
+            return r.text, "hämtad"
+        noteringar.append(f"EUR-Lex {namn}: HTTP {r.status_code}")
+    return None, "; ".join(noteringar)
+
+
+def _hamta_cellar_text(celex: str, sprak: str, manifest: _Manifestlista) -> tuple[str, str]:
+    """Hämtar text för en akt på ett språk. Returnerar (rå_text, format).
+
+    Formatet är 'xhtml', 'html' eller 'pdf'. För xhtml och html är texten
+    rå markup som anroparen rensar; för pdf är den redan extraherad.
+
+    Ordning:
+      1. Innehållsförhandling mot {CELLAR_REST_BASE}/{CELEX} för xhtml och html.
+      2. Manifestlistan via SPARQL (bara om steg 1 inte räckte): saknas
+         språket helt avbryts försöket här.
+      3. Innehållsförhandling för PDF, med den PDF-typ CELLAR anger
+         (application/pdf;type=pdfa1a o.s.v.).
+      4. Den äldre REST-vägen {CELEX}.{SPRÅK}.{format}.
+      5. EUR-Lex, om det svarar med innehåll och inte med botskydd.
+
+    Kastar CelexOkant, KallaSvararInte, HamtningsFel (okänd språkkod) eller
+    _TextSaknas med försöksloggen.
+    """
+    sprak2, sprak3 = _normalisera_sprak(sprak)
+    forsok: list[str] = []
+
+    for fmt, accept in _ACCEPT_TYP.items():
+        innehall, notering = _forhandla(celex, sprak3, accept)
+        forsok.append(f"{fmt}: {notering}")
+        if innehall:
+            return "\n".join(c.decode("utf-8", errors="replace") for c in innehall), fmt
+
+    lista = manifest.hamta()
+    typer = lista.get(sprak3, set()) if lista is not None else None
+    if lista and not typer:
+        forsok.append(f"CELLAR har ingen version på {sprak2}")
+        raise _TextSaknas(forsok)
+
+    # PDF-typen måste anges exakt; "application/pdf" räcker bara för typen pdf.
+    pdf_typer = (
+        sorted((t for t in typer if t.startswith("pdf")), key=lambda t: (t != "pdf", t))
+        if typer is not None else ["pdf"]
+    )
+    for typ in pdf_typer:
+        accept = "application/pdf" if typ == "pdf" else f"application/pdf;type={typ}"
+        innehall, notering = _forhandla(celex, sprak3, accept)
+        if innehall:
+            text, notering = _pdf_till_text(innehall)
+            if text:
+                return text, "pdf"
+        forsok.append(f"{typ}: {notering}")
+
+    for fmt in ("xhtml", "html", "pdf"):
+        if typer is not None and fmt not in typer:
+            continue
+        innehall, notering = _hamta_via_rest(celex, sprak3, fmt)
+        if innehall and fmt == "pdf":
+            text, notering = _pdf_till_text(innehall)
+            if text:
+                return text, "pdf"
+        elif innehall:
+            return "\n".join(c.decode("utf-8", errors="replace") for c in innehall), fmt
+        forsok.append(f"REST {fmt}: {notering}")
+
+    text, notering = _hamta_eurlex(celex, sprak2)
     if text:
         return text, "html"
+    forsok.append(notering)
+    raise _TextSaknas(forsok)
 
-    # 4b: LexUriServ (äldre API, levererar direkt utan async-rendering)
-    lexuriserv_url = f"{EURLEX_LEXURISERV_BASE}?uri=CELEX:{celex}:{lang2}:HTML"
-    log.info("Provar EUR-Lex LexUriServ: %s", lexuriserv_url)
-    text = _hamta_eurlex_html(lexuriserv_url)
-    if text:
-        return text, "html"
 
-    sista_fel = f"Både EUR-Lex huvud-URL och LexUriServ misslyckades för {celex} ({lang2})"
+def _beskriv_tillgangligt(lista: Optional[dict[str, set[str]]]) -> str:
+    """Beskriver vilka språk och format CELLAR har, för felmeddelanden."""
+    if lista is None:
+        return (
+            "Listan över tillgängliga språk och format kunde inte hämtas, "
+            "eftersom CELLAR:s SPARQL-tjänst inte svarade."
+        )
+    if not lista:
+        return "CELLAR har inga digitala versioner av akten på något språk."
+    grupper: dict[tuple[str, ...], list[str]] = {}
+    for sprak3, typer in lista.items():
+        grupper.setdefault(tuple(sorted(typer)), []).append(_SPRAK_2.get(sprak3, sprak3))
+    delar = [
+        f"{', '.join(sorted(sprak))} ({', '.join(typer)})"
+        for typer, sprak in sorted(grupper.items(), key=lambda g: -len(g[1]))
+    ]
+    return (
+        "Akten finns i CELLAR på: " + "; ".join(delar) + ". "
+        "Servern läser formaten xhtml, html och pdf."
+    )
 
-    raise ValueError(
-        f"Ingen textmanifestation hittades för {celex} ({lang2}). "
-        f"Provade: {', '.join(CELLAR_FORMAT_ORDNING)} via CELLAR + HTML via EUR-Lex. "
-        f"Senaste fel: {sista_fel}"
+
+def _hamta_text_med_sprakordning(
+    celex: str, sprakordning: list[str],
+) -> tuple[str, str, str]:
+    """Provar språken i tur och ordning. Returnerar (rå_text, format, språk).
+
+    Kastar HamtningsFel med ett meddelande som säger vilka språk och format
+    som finns, när inget av de provade språken gav text.
+    """
+    manifest = _Manifestlista(celex)
+    logg: list[str] = []
+    provade: list[str] = []
+    for sprak in dict.fromkeys(s.strip().upper() for s in sprakordning):
+        sprak2, _ = _normalisera_sprak(sprak)
+        if sprak2 in provade:
+            continue
+        provade.append(sprak2)
+        try:
+            raw, fmt = _hamta_cellar_text(celex, sprak2, manifest)
+            return raw, fmt, sprak2
+        except _TextSaknas as exc:
+            logg.append(f"{sprak2}: {'; '.join(exc.forsok)}")
+
+    raise HamtningsFel(
+        f"Ingen text för {celex} på {' eller '.join(provade)}. "
+        f"{_beskriv_tillgangligt(manifest.hamta())} "
+        "Ange ett tillgängligt språk med parametern sprak. "
+        f"Provat: {' | '.join(logg)}."
     )
 
 
@@ -698,10 +907,9 @@ def _hamta_sparql_metadata(celex: str) -> Optional[dict]:
     query = f"""PREFIX cdm: <http://publications.europa.eu/ontology/cdm#>
 SELECT ?titel ?datum ?eli ?typ
 WHERE {{
-  ?work cdm:resource_legal_id_celex ?celex_val ;
-        cdm:work_date_document ?datum ;
+  {_celex_monster("work", celex)}
+  ?work cdm:work_date_document ?datum ;
         cdm:work_has_resource-type ?typ_uri .
-  FILTER(STR(?celex_val) = "{_sparql_escape(celex)}")
   OPTIONAL {{ ?work cdm:resource_legal_eli ?eli . }}
   OPTIONAL {{
     ?expr cdm:expression_belongs_to_work ?work ;
@@ -721,7 +929,7 @@ WHERE {{
                 "eli":   r.get("eli"),
                 "typ":   typ_kod,
             }
-    except Exception as exc:
+    except HamtningsFel as exc:
         log.warning("Kunde inte hämta SPARQL-metadata för %s: %s", celex, exc)
     return None
 
@@ -859,32 +1067,16 @@ def hamta_eu_akt(celex: str, sprak: str = "SV",
             "fulltext":   _trunkera(fulltext_full),
         }
 
-    # Hämta SPARQL-metadata
+    # Texten hämtas före metadatan: ett okänt CELEX-nummer avslöjas då
+    # redan av första anropet mot CELLAR.
+    try:
+        raw, anvant_format, anvant_sprak = _hamta_text_med_sprakordning(
+            celex, [sprak, "EN"],
+        )
+    except HamtningsFel as exc:
+        return {"fel": str(exc)}
+
     meta = _hamta_sparql_metadata(celex) or {}
-
-    # Hämta fulltext via CELLAR REST (WEMI-protokollet, format-fallback)
-    anvant_sprak = sprak
-    anvant_format: Optional[str] = None
-    raw: Optional[str] = None
-
-    for forsok_sprak in ([sprak, "EN"] if sprak != "EN" else [sprak]):
-        try:
-            raw, anvant_format = _hamta_cellar_text(celex, forsok_sprak)
-            anvant_sprak = forsok_sprak
-            break
-        except ValueError:
-            continue
-        except requests.RequestException as exc:
-            return {"fel": f"Nätverksfel vid hämtning av {celex!r}: {exc}"}
-
-    if raw is None:
-        return {
-            "fel": (
-                f"Dokumentet {celex!r} hittades inte i något tillgängligt format. "
-                f"Provade: CELLAR ({', '.join(CELLAR_FORMAT_ORDNING)}) + EUR-Lex (TXT/HTML + LexUriServ). "
-                "Kontrollera CELEX-numret."
-            )
-        }
 
     # Konvertera till klartext — full otrunkerad text för cachelagring
     fulltext_full = _rensa_html(raw) if anvant_format in ("xhtml", "html") else raw
@@ -958,9 +1150,8 @@ def hamta_eu_akt(celex: str, sprak: str = "SV",
         "Hämtar fulltext för ett EU-domstolsavgörande. "
         "Accepterar EU-domstolens målnummer (C-441/17, C-30/19 PPU) "
         "och Tribunalens målnummer (T-325/15). "
-        "OBS: Tribunalens domar (T-xxx) saknar HTML via CELLAR REST — "
-        "metadata returneras men fulltext kan saknas. "
-        "Äldre mål saknar ofta svensk version — prova sprak='FR' eller 'EN'."
+        "Saknas avgörandet på önskat språk provas franska och sedan engelska; "
+        "fältet sprak i svaret visar vilket språk texten har."
     ),
 )
 def hamta_eu_mal(malnum: str, sprak: str = "SV") -> dict:
@@ -991,50 +1182,16 @@ def hamta_eu_mal(malnum: str, sprak: str = "SV") -> dict:
             "fulltext":  _trunkera(fulltext_full),
         }
 
-    # Tribunalen: REST HTML fungerar inte — returnera metadata
-    if domstol in ("TJ", "TO"):
-        meta = _hamta_sparql_metadata(celex) or {}
-        return {
-            "malnum":   malnum_rensat,
-            "celex":    celex,
-            "domstol":  domstol,
-            "titel":    meta.get("titel"),
-            "datum":    meta.get("datum"),
-            "eli":      meta.get("eli"),
-            "fulltext": None,
-            "not": (
-                "Tribunalens domar saknar HTML-fulltext via CELLAR REST API. "
-                "Metadata ovan hämtat via SPARQL. "
-                "Fulltext tillgänglig på EUR-Lex: "
-                f"https://eur-lex.europa.eu/legal-content/SV/TXT/?uri=CELEX:{celex}"
-            ),
-        }
+    # Franska är domstolens arbetsspråk och finns för alla avgöranden;
+    # äldre mål saknar ofta svensk version.
+    try:
+        raw, anvant_format, anvant_sprak = _hamta_text_med_sprakordning(
+            celex, [sprak, "FR", "EN"],
+        )
+    except HamtningsFel as exc:
+        return {"fel": f"Avgörande {malnum_rensat} (CELEX {celex}): {exc}"}
 
     meta = _hamta_sparql_metadata(celex) or {}
-    raw: Optional[str] = None
-    anvant_sprak = sprak
-    anvant_format: Optional[str] = None
-
-    # EU-domstolen: prova SV → FR → EN, med format-fallback per språk
-    for forsok_sprak in ([sprak, "FR", "EN"] if sprak not in ("FR", "EN") else [sprak, "EN"]):
-        try:
-            raw, anvant_format = _hamta_cellar_text(celex, forsok_sprak)
-            anvant_sprak = forsok_sprak
-            break
-        except ValueError:
-            continue
-        except requests.RequestException as exc:
-            return {"fel": f"Nätverksfel: {exc}"}
-
-    if raw is None:
-        return {
-            "fel": (
-                f"Avgörande {malnum_rensat!r} (CELEX: {celex}) hittades inte i något "
-                f"tillgängligt format. Provade: CELLAR "
-                f"({', '.join(CELLAR_FORMAT_ORDNING)}) + EUR-Lex (TXT/HTML + LexUriServ). "
-                "Kontrollera målnumret."
-            )
-        }
 
     fulltext_full = _rensa_html(raw) if anvant_format in ("xhtml", "html") else raw
     _indexera_akt(celex, anvant_sprak, fulltext_full,
@@ -1119,6 +1276,16 @@ def sok_i_cachade_akter(
         "antal":   len(samlade),
         "treffar": samlade[:max_antal],
     }
+
+
+# Titelsökningen är en CONTAINS över alla titlar på språket. Utan typ- eller
+# årsfilter, och särskilt när inget matchar, går tjänsten igenom allt och kan
+# slå i tidsgränsen.
+_SOK_TIDSGRANS_TIPS = (
+    "Titelsökning utan träff och utan avgränsning kan ta längre tid än "
+    "tidsgränsen, eftersom tjänsten då går igenom alla titlar. Avgränsa med "
+    "typ och ar_fran/ar_till, prova en annan sökterm eller försök igen senare."
+)
 
 
 @mcp.tool(
@@ -1220,8 +1387,8 @@ LIMIT {max_antal}"""
 
     try:
         rader = _kora_sparql(sparql_query)
-    except requests.RequestException as exc:
-        return {"fel": f"SPARQL-anrop misslyckades: {exc}"}
+    except HamtningsFel as exc:
+        return {"fel": f"{exc} {_SOK_TIDSGRANS_TIPS}"}
 
     return {
         "antal":       len(rader),
@@ -1289,8 +1456,7 @@ def hitta_nationellt_genomforande(
 
 SELECT DISTINCT ?genomf_celex ?stat ?titel ?datum
 WHERE {{
-  ?direktiv cdm:resource_legal_id_celex ?dir_celex .
-  FILTER(STR(?dir_celex) = "{_sparql_escape(celex)}")
+  {_celex_monster("direktiv", celex)}
 
   ?genomf cdm:measure_national_implementing_implements_resource_legal ?direktiv ;
           cdm:resource_legal_id_celex ?genomf_celex ;
@@ -1318,7 +1484,7 @@ LIMIT 100"""
                     "medlemsstat": stat_kod_resultat,
                     "kalla":      "CELLAR",
                 })
-    except requests.RequestException as exc:
+    except HamtningsFel as exc:
         log.warning("SPARQL misslyckades för genomförande av %s: %s", celex, exc)
 
     # Riksdag-sökning som komplement för Sverige.
