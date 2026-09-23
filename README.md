@@ -18,14 +18,30 @@ Förordning, delegerad förordning, genomförandeförordning, direktiv, delegera
 
 ## Domstolstäckning
 
-- **EU-domstolen** (C-xxx): fulltext + metadata via REST
-- **Tribunalen** (T-xxx): metadata + länk till EUR-Lex (HTML ej tillgängligt via CELLAR REST API)
-- **Personaldomstolen** (F-xxx): metadata + länk till EUR-Lex
+- **EU-domstolen** (C-xxx), **Tribunalen** (T-xxx) och **Personaldomstolen** (F-xxx):
+  fulltext och metadata från CELLAR. Saknas avgörandet på önskat språk provas
+  franska och sedan engelska.
+
+## Texthämtning
+
+Texten hämtas från CELLAR genom innehållsförhandling:
+`GET http://publications.europa.eu/resource/celex/{CELEX}` med `Accept`
+(`application/xhtml+xml`, `text/html` eller `application/pdf;type=...`) och
+`Accept-Language` (trebokstavskod, t.ex. `swe`). CELLAR svarar 303 till
+dokumentet. Räcker inte det provas den äldre vägen `{CELEX}.{SPRÅK}.{format}`
+och sist EUR-Lex. EUR-Lex ligger bakom AWS WAF; svarar det med en utmaning
+(202 och `x-amzn-waf-action`) avbryts försöket i stället för att upprepas.
+
+Finns akten inte på det begärda språket säger felbeskedet vilka språk och
+format CELLAR har. Servern identifierar sig med en egen User-Agent
+(`CELLAR_USER_AGENT`) och ser aldrig ut som en webbläsare.
 
 ## Förutsättningar
 
 - Python 3.11+
-- PostgreSQL 15+ med tillägget `pgvector`
+- MCP Python SDK 2.x (`mcp>=2.0,<3`, installeras via `requirements.txt`)
+- PostgreSQL 15+ med tillägget `pgvector`, eller SQLite (en lokal fil;
+  LIKE-sökning, ingen semantisk sökning)
 - Internetåtkomst mot `publications.europa.eu` (CELLAR)
 
 ## Installation
@@ -44,9 +60,14 @@ pip install -r requirements.txt
 # stdio (Claude Desktop)
 python3 mcp_server.py
 
-# HTTP
-MCP_TRANSPORT=http python3 mcp_server.py
+# HTTP (Streamable HTTP på http://MCP_HOST:MCP_PORT/mcp, standardport 8010)
+MCP_TRANSPORT=http MCP_API_KEY=<NYCKEL> python3 mcp_server.py
 ```
+
+http-läget kräver `MCP_API_KEY`. Utan nyckel avbryts uppstarten med
+exitkod 2. Klienten skickar nyckeln som `Authorization: Bearer <NYCKEL>`;
+anrop utan header får 401 och med fel nyckel 403. Generera en nyckel med
+`python3 -c "import secrets; print(secrets.token_hex(32))"`.
 
 ## Claude Desktop-konfiguration
 

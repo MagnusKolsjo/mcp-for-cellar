@@ -1,5 +1,53 @@
 # Ändringslogg
 
+## [Unreleased]
+
+### Ändrat
+- **Brytande:** kräver MCP Python SDK 2.x (`mcp>=2.0,<3`). Servern bygger på
+  `MCPServer`, rapporterar sin version och har cachningshintar.
+- **Brytande:** http-läget kräver `MCP_API_KEY` och startar inte utan den
+  (exitkod 2). Transporten är Streamable HTTP på `/mcp`, standardport 8010.
+- **Brytande (returstruktur):** förväntade fel returneras inte längre som
+  `{"fel": ...}` utan som felsvar (`isError`) med ett begripligt meddelande:
+  okänt CELEX-nummer, språk som saknas, okänd språkkod, okänd typ, artikel
+  som inte finns, SPARQL-tidsgräns och fel mot CELLAR. `hitta_nationellt_genomforande`
+  ger felsvar när CELLAR-frågan misslyckas i stället för en tom lista.
+- Texten hämtas i första hand genom innehållsförhandling mot
+  `publications.europa.eu/resource/celex/{CELEX}` (`Accept`, `Accept-Language`).
+  Den äldre vägen `{CELEX}.{SPRÅK}.{format}` provas därefter och EUR-Lex sist.
+- Tribunalens och Personaldomstolens avgöranden hämtas med fulltext som
+  EU-domstolens, i stället för enbart metadata.
+- Alla verktyg har titel, annotationer och utdataschema (`outputSchema`).
+- Projektets egen User-Agent används mot alla källor; ny variabel
+  `CELLAR_USER_AGENT`.
+- SPARQL-frågor som gäller en viss akt binder CELEX-numret direkt och tar
+  under en sekund i stället för tiotals sekunder.
+- Embeddings räknas bara när de lagras (PostgreSQL).
+
+### Tillagt
+- Felbeskedet när en akt saknas på det begärda språket listar de språk och
+  format CELLAR har.
+- PDF hämtas med den PDF-typ CELLAR anger (`application/pdf;type=pdfa1a` m.fl.).
+- `hitta_nationellt_genomforande`: fältet `riksdag_fel` när sökningen i
+  riksdagens öppna data misslyckas.
+
+### Rättat
+- http-läget startade inte (anropade `mcp.get_asgi_app()`, som inte finns).
+- Texthämtningen gav 404 för bl.a. 32016R0679 och 32024R1689 trots att
+  CELLAR har texten.
+- EUR-Lex svar 202 tolkades som pågående rendering och gjordes om. Det är
+  botskyddets utmaning och känns nu igen utan nya försök.
+- Aktens typkod sparades aldrig i cachen, och avgöranden sparades med typen
+  `dom`, så typfiltret i `sok_i_cachade_akter` träffade inte nyhämtade akter.
+  Redan cachade rader behåller sitt tidigare värde tills akten hämtas om.
+- Lat inläsning av embeddingmodellen är skyddad med lås, eftersom verktygen
+  körs på arbetstrådar.
+- `pdfplumber` saknades i `requirements.txt`.
+
+### Borttaget
+- `[cli]`-extrat i `mcp`-beroendet, som inte används.
+- Egen Starlette-app och Bearer-middleware; transporten sköts av `mcp_transport.py`.
+
 ## [1.1.0] — 2026-05-21
 
 ### Rättat
