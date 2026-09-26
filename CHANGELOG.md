@@ -2,7 +2,10 @@
 
 ## [Unreleased]
 
+## [2.0.0] — 2026-09-26
+
 ### Ändrat
+- User-Agent-strängen följer huvudversionen (härleds ur `VERSION`).
 - **Brytande:** kräver MCP Python SDK 2.x (`mcp>=2.0,<3`). Servern bygger på
   `MCPServer`, rapporterar sin version och har cachningshintar.
 - **Brytande:** http-läget kräver `MCP_API_KEY` och startar inte utan den
