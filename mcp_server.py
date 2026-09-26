@@ -113,7 +113,7 @@ def expandera_fraga(query: str) -> list[str]:
     eller misslyckas.
 
     Aktiveras via QUERY_EXPANSION_ENABLED=true i .env. Stöder alla
-    OpenAI-kompatibla endpoints (Claude, OpenAI, Ollama, LM Studio).
+    OpenAI-kompatibla endpoints (till exempel Anthropic, OpenAI, Ollama, LM Studio).
     Promptfilen (prompts/expansion_prompt.txt) kan redigeras fritt.
     """
     if not QUERY_EXPANSION_ENABLED:
