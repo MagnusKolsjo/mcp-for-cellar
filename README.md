@@ -57,7 +57,7 @@ pip install -r requirements.txt
 ## Starta servern
 
 ```
-# stdio (Claude Desktop)
+# stdio (lokal MCP-klient)
 python3 mcp_server.py
 
 # HTTP (Streamable HTTP på http://MCP_HOST:MCP_PORT/mcp, standardport 8010)
@@ -69,9 +69,9 @@ exitkod 2. Klienten skickar nyckeln som `Authorization: Bearer <NYCKEL>`;
 anrop utan header får 401 och med fel nyckel 403. Generera en nyckel med
 `python3 -c "import secrets; print(secrets.token_hex(32))"`.
 
-## Claude Desktop-konfiguration
+## Konfiguration i MCP-klienten
 
-Lägg till i `claude_desktop_config.json`:
+Lägg till i MCP-klientens konfiguration (`mcpServers`):
 
 ```json
 {
