@@ -157,6 +157,27 @@ def expandera_fraga(query: str) -> list[str]:
 _modell = None
 _modell_las = threading.Lock()
 
+# PyTorchs MPS-backend är inte trådsäker: MetalShaderLibrary fyller sina
+# kärncacher utan lås första gången de används, så två samtidiga encode() från
+# arbetstrådarna kan korrumpera dem och krascha hela processen med SIGSEGV.
+# Låset gäller hela processen och inte en enskild modell, eftersom cacherna
+# delas av alla modeller på samma enhet.
+_encode_las = threading.Lock()
+
+
+class _SerialiseradModell:
+    """Omsluter en SentenceTransformer så att encode() alltid tar _encode_las."""
+
+    def __init__(self, modell) -> None:
+        self._modell = modell
+
+    def encode(self, *args, **kwargs):
+        with _encode_las:
+            return self._modell.encode(*args, **kwargs)
+
+    def __getattr__(self, namn):
+        return getattr(self._modell, namn)
+
 
 def _hamta_modell():
     """Laddar embeddingmodellen första gången den behövs.
@@ -171,7 +192,7 @@ def _hamta_modell():
             if _modell is None:
                 from sentence_transformers import SentenceTransformer
                 log.info("Laddar embeddingmodell: %s", EMBEDDING_MODEL)
-                _modell = SentenceTransformer(EMBEDDING_MODEL)
+                _modell = _SerialiseradModell(SentenceTransformer(EMBEDDING_MODEL))
     return _modell
 
 
