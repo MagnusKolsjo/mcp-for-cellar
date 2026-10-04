@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### Tillagt
+
+- `efterfyll_typkod.py` fyller i CELLAR:s typkod för cachade akter som sparades utan den
+  eller med typen `dom`, så att typfiltret i `sok_i_cachade_akter` träffar dem. `--torrkorning`
+  visar ändringarna utan att skriva.
+
 ### Fixat
 
 - Samtidiga sökanrop kunde krascha servern med SIGSEGV när embeddingmodellen kördes på
