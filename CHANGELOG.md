@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [2.1.0] — 2026-10-06
+
 ### Tillagt
 
 - `efterfyll_typkod.py` fyller i CELLAR:s typkod för cachade akter som sparades utan den

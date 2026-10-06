@@ -60,7 +60,7 @@ CELLAR_REST_BASE = os.getenv(
 )
 # Senaste släppta version enligt CHANGELOG.md. Rapporteras till klienten
 # och ingår i User-Agent, så att källorna kan se vilken version som anropar.
-VERSION = "2.0.0"
+VERSION = "2.1.0"
 
 # Projektets egen User-Agent, med kontaktväg. Den ska aldrig se ut som en
 # webbläsare: en ärlig identifiering är det källan kan agera på.
